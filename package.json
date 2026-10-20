@@ -19,6 +19,7 @@
     "samples": "node scripts/generate-samples.mjs",
     "smoke:import": "tsx scripts/smoke-import.ts",
     "mock:model": "node scripts/mock-model.mjs",
+    "pacing:check": "tsx scripts/pacing-check.mjs",
     "format": "prettier --write src scripts tests *.ts *.mjs *.json README.md AGENTS.md samples/README.md"
   },
   "dependencies": {

@@ -1,4 +1,5 @@
 import { CardSchema, VerdictSchema, type Card, type Figure } from "./cards";
+import { createGuidanceLimiter } from "./pacing";
 
 export type StreamEvent =
   | { type: "text"; delta: string }
@@ -13,7 +14,7 @@ const OPENERS = ["verdict", "card", "diagram", "slides", "slide", "json"].map(
   (kind) => "```" + kind,
 );
 const VERDICT_RE =
-  /^\[判定\]\s*([^·|｜:：,，\s]+)\s*[·|｜:：,，]?\s*(K\d+)?\s*[·|｜:：,，]?\s*(.*)$/;
+  /^\[判定\]\s*(对|正确|√|✔|错|错误|不对|×|✘)(?:\s*[·|｜:：,，]\s*([^·|｜:：,，]*))?(?:\s*[·|｜:：,，]\s*(.*))?$/;
 
 function emitVerdict(raw: string, emit: (event: StreamEvent) => void): boolean {
   const match = raw.trim().match(VERDICT_RE);
@@ -23,7 +24,7 @@ function emitVerdict(raw: string, emit: (event: StreamEvent) => void): boolean {
     emit({
       type: "verdict",
       correct: /^(对|正确|√|✔)$/.test(token),
-      topic: match[2] || undefined,
+      topic: match[2]?.trim() || undefined,
       reason: match[3] || undefined,
     });
   }
@@ -127,6 +128,7 @@ function handleFence(
 export function createChatParser(
   emitRaw: (event: StreamEvent) => void,
   maxPage: number,
+  options: { enforcePacing?: boolean } = {},
 ) {
   let buffer = "";
   let fence: FenceKind | null = null;
@@ -134,7 +136,14 @@ export function createChatParser(
   let verdictChecked = false;
   let spoke = false;
   let ended = false;
+  let cardEmitted = false;
+  const enforcePacing = options.enforcePacing !== false;
+  const limitGuidance = createGuidanceLimiter();
   const emit = (event: StreamEvent) => {
+    if (event.type === "card" && enforcePacing) {
+      if (cardEmitted) return;
+      cardEmitted = true;
+    }
     const figure =
       event.type === "figure"
         ? event.figure
@@ -166,6 +175,10 @@ export function createChatParser(
     }
     spoke = true;
     emitRaw(event);
+  };
+  const emitProse = (delta: string) => {
+    const text = enforcePacing ? limitGuidance(delta) : delta;
+    if (text) emit({ type: "text", delta: text });
   };
   const consume = (final: boolean) => {
     if (!verdictChecked) {
@@ -210,8 +223,7 @@ export function createChatParser(
           buffer,
         );
       if (match) {
-        if (match.index)
-          emit({ type: "text", delta: buffer.slice(0, match.index) });
+        if (match.index) emitProse(buffer.slice(0, match.index));
         buffer = buffer.slice(match.index + match[0].length);
         fenceOpening = match[0];
         fence = match[1]
@@ -233,7 +245,7 @@ export function createChatParser(
         if (partial) keep = Math.max(keep, buffer.length - partial.index);
       }
       const text = buffer.slice(0, buffer.length - keep);
-      if (text) emit({ type: "text", delta: text });
+      if (text) emitProse(text);
       buffer = keep ? buffer.slice(-keep) : "";
       return;
     }

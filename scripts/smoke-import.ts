@@ -55,21 +55,18 @@ async function main() {
   const web = spawn(
     process.execPath,
     [
-      "node_modules/next/dist/bin/next",
+      "scripts/smoke-server.mjs",
+      String(port),
       existsSync(path.join(process.env.NEXT_DIST_DIR || ".next", "BUILD_ID"))
         ? "start"
         : "dev",
-      "--hostname",
-      "127.0.0.1",
-      "--port",
-      String(port),
     ],
-    { env, stdio: ["ignore", "pipe", "pipe"] },
+    { env, stdio: ["ignore", "pipe", "pipe", "ipc"] },
   );
-  web.stdout.on("data", (data) => {
+  web.stdout!.on("data", (data) => {
     log = (log + data).slice(-30000);
   });
-  web.stderr.on("data", (data) => {
+  web.stderr!.on("data", (data) => {
     log = (log + data).slice(-30000);
   });
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
@@ -106,15 +103,19 @@ async function main() {
     child.stderr.on("data", (b) => {
       output += b;
     });
-    const timeout = setTimeout(() => child.kill("SIGKILL"), 240_000);
+    let timeout: ReturnType<typeof setTimeout>;
     try {
       const code = await new Promise<number | null>((resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("Smoke worker 超时，保留进程供排查")),
+          240_000,
+        );
         child.on("exit", resolve);
         child.on("error", reject);
       });
       assert.equal(code, 0, output);
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(timeout!);
     }
   }
   async function checkJob(id: string) {
@@ -522,15 +523,11 @@ async function main() {
     throw error;
   } finally {
     await browser?.close();
-    web.kill("SIGTERM");
     await new Promise<void>((resolve) => {
       if (web.exitCode !== null) resolve();
       else {
         web.once("exit", () => resolve());
-        setTimeout(() => {
-          web.kill("SIGKILL");
-          resolve();
-        }, 5000).unref();
+        web.send("close");
       }
     });
     await mock.close();

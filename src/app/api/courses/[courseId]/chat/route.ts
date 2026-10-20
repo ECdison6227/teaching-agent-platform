@@ -1,7 +1,8 @@
 import { courseContent, HttpError } from "@/lib/courses";
 import { api, readJson } from "@/lib/http";
 import { buildPrompt } from "@/lib/prompt";
-import { chat, resolveProviderConfig } from "@/lib/models/provider";
+import { resolveProviderConfig } from "@/lib/models/provider";
+import { pacedChat } from "@/lib/chat-pacing";
 import { chatRequestSchema } from "@/lib/request-validation";
 import { createChatParser, type StreamEvent } from "@/lib/chat-protocol";
 import { requestScope, requestError } from "@/lib/request-lifecycle";
@@ -34,7 +35,7 @@ export async function POST(
         const parser = createChatParser(emit, data.pages.length);
         try {
           if (config) {
-            for await (const delta of chat(
+            for await (const delta of pacedChat(
               [
                 {
                   role: "system",
@@ -44,6 +45,7 @@ export async function POST(
               ],
               scope.signal,
               input.model,
+              data.pages.length,
             ))
               parser.push(delta);
           } else {
