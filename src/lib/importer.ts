@@ -1,5 +1,3 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { mkdir, readFile, writeFile, copyFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -27,30 +25,22 @@ import {
   TextbookSchema,
 } from "./import-schemas";
 import { z } from "zod";
+import { command } from "./import-command";
+import { mapImportPages } from "./import-settings";
+import {
+  generatePageNote,
+  pageTitle,
+  type PageNoteResult,
+} from "./import-page-notes";
 
-const run = promisify(execFile);
 type ParsedPage = {
   text: string;
   imageKey: string;
   width: number;
   height: number;
-  cachedNote?: z.infer<typeof PageNoteSchema>;
-  model?: string;
+  cachedNote?: PageNoteResult;
 };
 type ParsedSource = { source: Source; pages: ParsedPage[] };
-const command = async (bin: string, args: string[]) => {
-  try {
-    return await run(bin, args, {
-      timeout: 120_000,
-      maxBuffer: 4 * 1024 * 1024,
-      killSignal: "SIGKILL",
-    });
-  } catch {
-    throw new Error(
-      `${bin} 转换失败或超时；请检查文件是否损坏、加密，以及系统依赖是否安装`,
-    );
-  }
-};
 function qaNote(note: z.infer<typeof PageNoteSchema>, ruleBased = false) {
   if (ruleBased) return "needs_review" as const;
   try {
@@ -67,26 +57,6 @@ function qaNote(note: z.infer<typeof PageNoteSchema>, ruleBased = false) {
     return "needs_review" as const;
   }
 }
-function fallbackNote(
-  text: string,
-  title: string,
-): z.infer<typeof PageNoteSchema> {
-  return {
-    title,
-    points: text.trim()
-      ? text
-          .split(/\n|(?<=[。.!?])\s+/)
-          .map((s) => s.trim())
-          .filter(Boolean)
-          .slice(0, 5)
-          .map((s) => s.slice(0, 400))
-      : ["此页未提取到文本，请查看页图；配置视觉模型后可重新导入。"],
-    keys: [title],
-  };
-}
-const notePrompt = (text: string, title: string) =>
-  `整理这一页的学习要点，不补充原文以外的结论。返回 JSON {"title":"标题","points":["1–5 条要点，可用 $LaTeX$"],"keys":["关键词"],"text":"页面原文；扫描页必须转录"}。\n标题参考：${title}\n原文：\n${text.slice(0, 18000)}`;
-
 /** 原子领取：Web 与多个 worker 使用同一个 SQLite 队列。 */
 export function claimJob() {
   const { db, sqlite } = database();
@@ -166,6 +136,7 @@ export async function importJob(jobId: string) {
       .from(courses)
       .where(eq(courses.id, courseId))
       .get()!;
+    const language = course.language?.trim() || "zh";
     const input = db
       .select()
       .from(sources)
@@ -223,65 +194,65 @@ export async function importJob(jobId: string) {
       totalPages += count;
       if (totalPages > 500)
         throw new Error("MVP 单课程总页数上限为 500，请拆分课程资料");
-      const sourcePages: ParsedPage[] = [];
-      for (let i = 1; i <= count; i++) {
-        progress(
-          3 + Math.round(((si + i / count) / input.length) * 27),
-          `提取页图与文本：资料 ${si + 1}/${input.length} · ${i}/${count} 页`,
-        );
-        const imageKey = `${folderKey}/page-${i}.png`,
-          textFile = path.join(folder, `page-${i}.txt`);
-        await command("pdftoppm", [
-          "-f",
-          String(i),
-          "-l",
-          String(i),
-          "-singlefile",
-          "-scale-to",
-          "1400",
-          "-png",
-          pdf,
-          storagePath(imageKey).slice(0, -4),
-        ]);
-        await command("pdftotext", [
-          "-f",
-          String(i),
-          "-l",
-          String(i),
-          "-layout",
-          "-enc",
-          "UTF-8",
-          pdf,
-          textFile,
-        ]);
-        let text = redactPII(
-          (await readFile(textFile, "utf8")).replace(/\f/g, "").trim(),
-        );
-        const bytes = await readFile(storagePath(imageKey));
-        const page: ParsedPage = {
-          text,
-          imageKey,
-          width: bytes.readUInt32BE(16),
-          height: bytes.readUInt32BE(20),
-        };
-        if (!text && resolveProviderConfig("notes", true)) {
-          const result = await structured(
-            "notes",
-            PageNoteSchema,
-            notePrompt("", `第 ${i} 页`),
-            `data:image/png;base64,${bytes.toString("base64")}`,
+      const sourcePages = await mapImportPages(
+        Array.from({ length: count }, (_, i) => i + 1),
+        async (i): Promise<ParsedPage> => {
+          const imageKey = `${folderKey}/page-${i}.png`,
+            textFile = path.join(folder, `page-${i}.txt`);
+          await command("pdftoppm", [
+            "-f",
+            String(i),
+            "-l",
+            String(i),
+            "-singlefile",
+            "-scale-to",
+            "1400",
+            "-png",
+            pdf,
+            storagePath(imageKey).slice(0, -4),
+          ]);
+          await command("pdftotext", [
+            "-f",
+            String(i),
+            "-l",
+            String(i),
+            "-layout",
+            "-enc",
+            "UTF-8",
+            pdf,
+            textFile,
+          ]);
+          let text = redactPII(
+            (await readFile(textFile, "utf8")).replace(/\f/g, "").trim(),
           );
-          if (result) {
+          const bytes = await readFile(storagePath(imageKey));
+          const page: ParsedPage = {
+            text,
+            imageKey,
+            width: bytes.readUInt32BE(16),
+            height: bytes.readUInt32BE(20),
+          };
+          if (!text && resolveProviderConfig("notes", true)) {
+            const result = await generatePageNote({
+              text,
+              language,
+              image: `data:image/png;base64,${bytes.toString("base64")}`,
+              transcribe: true,
+            });
             tokens += result.tokens;
-            text = redactPII(result.data.text || result.data.points.join("\n"));
+            text = redactPII(result.note.text || "");
             page.text = text;
-            page.cachedNote = result.data;
-            page.model = result.model;
+            page.cachedNote = result;
           }
-        }
-        await writeFile(textFile, text);
-        sourcePages.push(page);
-      }
+          await writeFile(textFile, text);
+          return page;
+        },
+        (completed) =>
+          progress(
+            3 + Math.round(((si + completed / count) / input.length) * 27),
+            `提取页图与文本：资料 ${si + 1}/${input.length} · ${completed}/${count} 页`,
+          ),
+      );
       const textKey = `${folderKey}/text.txt`;
       await writeFile(
         storagePath(textKey),
@@ -302,7 +273,7 @@ export async function importJob(jobId: string) {
     if (!allPages.length) throw new Error("缺少课程 PPT 或教材页面");
     const summaries = allPages.map((p, i) => ({
       page: i + 1,
-      title: p.text.split("\n")[0]?.slice(0, 120) || `第 ${i + 1} 页`,
+      title: p.cachedNote?.note.title || pageTitle(p.text, language),
       text: p.text.slice(0, 800),
     }));
     progress(33, "划分章节与知识点");
@@ -396,59 +367,54 @@ export async function importJob(jobId: string) {
           .run();
       }
     });
-    const persistedPages: (typeof pages.$inferSelect)[] = [];
-    for (const [i, page] of allPages.entries()) {
-      progress(
-        36 + Math.round((i / allPages.length) * 29),
-        `整理逐页要点 ${i + 1}/${allPages.length}`,
-      );
-      let note = page.cachedNote,
-        model = page.model,
-        isRule = false;
-      if (!note) {
-        const image = resolveProviderConfig("notes", true)
-          ? `data:image/png;base64,${(await readFile(storagePath(page.imageKey))).toString("base64")}`
-          : undefined;
-        const notesResult = await structured(
-          "notes",
-          PageNoteSchema,
-          notePrompt(page.text, summaries[i].title),
-          image,
-        );
-        tokens += notesResult?.tokens || 0;
-        note = notesResult?.data || fallbackNote(page.text, summaries[i].title);
-        model = notesResult?.model || "rules:no-model";
-        isRule = !notesResult;
-      }
-      const row = db
-        .insert(pages)
-        .values({
-          id: uid(),
-          courseId,
-          sourceId: page.source.id,
-          sourcePage: page.sourcePage,
-          index: i + 1,
-          imageKey: page.imageKey,
-          width: page.width,
-          height: page.height,
-          rawText: page.text,
-          title: redactPII(note.title),
-          kpId: pageToKp.get(i + 1)!,
-        })
-        .returning()
-        .get();
-      db.insert(pageNotes)
-        .values({
-          pageId: row.id,
-          title: row.title,
-          points: note.points.map(redactPII),
-          keys: note.keys.map(redactPII),
-          model: model!,
-          qaStatus: qaNote(note, isRule),
-        })
-        .run();
-      persistedPages.push(row);
-    }
+    progress(36, `整理逐页要点 0/${allPages.length}`);
+    const persistedPages = await mapImportPages(
+      allPages,
+      async (page, i) => {
+        let result = page.cachedNote;
+        if (!result) {
+          const image = resolveProviderConfig("notes", true)
+            ? `data:image/png;base64,${(await readFile(storagePath(page.imageKey))).toString("base64")}`
+            : undefined;
+          result = await generatePageNote({ text: page.text, language, image });
+          tokens += result.tokens;
+        }
+        const { note, model, ruleBased } = result;
+        const row = db
+          .insert(pages)
+          .values({
+            id: uid(),
+            courseId,
+            sourceId: page.source.id,
+            sourcePage: page.sourcePage,
+            index: i + 1,
+            imageKey: page.imageKey,
+            width: page.width,
+            height: page.height,
+            rawText: page.text,
+            title: redactPII(note.title),
+            kpId: pageToKp.get(i + 1)!,
+          })
+          .returning()
+          .get();
+        db.insert(pageNotes)
+          .values({
+            pageId: row.id,
+            title: row.title,
+            points: note.points.map(redactPII),
+            keys: note.keys.map(redactPII),
+            model,
+            qaStatus: qaNote(note, ruleBased),
+          })
+          .run();
+        return row;
+      },
+      (completed) =>
+        progress(
+          36 + Math.round((completed / allPages.length) * 29),
+          `整理逐页要点 ${completed}/${allPages.length}`,
+        ),
+    );
     const textbookPages = parsed
       .filter((s) => s.source.kind === "textbook")
       .flatMap((s) => s.pages);

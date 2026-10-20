@@ -172,12 +172,13 @@ export async function structured<S extends z.ZodTypeAny>(
   schema: S,
   input: string,
   image?: string,
+  options: { retries?: 0 | 1 | 2 } = {},
 ): Promise<{ data: z.output<S>; model: string; tokens: number } | null> {
   const cfg =
     (image && resolveProviderConfig(task, true)) || resolveProviderConfig(task);
   if (!cfg) return null;
   let lastError: unknown;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt <= (options.retries ?? 1); attempt++) {
     try {
       const res = await fetch(`${cfg.baseUrl}/chat/completions`, {
         method: "POST",

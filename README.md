@@ -67,6 +67,21 @@ npm run worker
 
 导入失败会记录错误，可点击“重新导入”。重跑替换该课程的派生内容，保留上传原件。worker 每 10 秒写心跳，意外退出后，运行中的任务会在下次 worker 扫描时于 5 分钟过期后标记失败，之后可重试。运行中请勿同时启动多个不同版本的 Web / worker。
 
+大文件导入可在 `.env.local` 配置以下参数，重启 worker 后生效：
+
+| 环境变量                               | 默认值   | 用途                                                   |
+| -------------------------------------- | -------- | ------------------------------------------------------ |
+| `IMPORT_SOFFICE_TIMEOUT_MS`            | `900000` | LibreOffice 转换超时，15 分钟                          |
+| `IMPORT_PDFINFO_TIMEOUT_MS`            | `120000` | PDF 信息读取超时                                       |
+| `IMPORT_PDFTOPPM_TIMEOUT_MS`           | `120000` | 页图转换基础超时                                       |
+| `IMPORT_PDFTOPPM_PER_PAGE_TIMEOUT_MS`  | `30000`  | 页图转换每页追加预算                                   |
+| `IMPORT_PDFTOTEXT_TIMEOUT_MS`          | `120000` | PDF 文本提取基础超时                                   |
+| `IMPORT_PDFTOTEXT_PER_PAGE_TIMEOUT_MS` | `10000`  | 文本提取每页追加预算                                   |
+| `IMPORT_COMMAND_TIMEOUT_MS`            | `120000` | 其他外部命令超时                                       |
+| `IMPORT_PAGE_CONCURRENCY`              | `4`      | 页图/文本提取、扫描页 OCR 和逐页要点的并发上限（1–16） |
+
+超时单位均为毫秒，须为正整数；无效配置使用默认值，并发大于 16 时取 16。Poppler 超时为基础值加上本次处理页数乘以每页预算；当前每条命令处理一页。转换命令各自使用独立进程组，超时、非零退出或输出超限时清理整组子进程。OCR 与要点按完成页数推进进度，结果仍按原页码保存；单页模型失败重试 2 次后保留页图、降级为规则要点并标记待核对，不阻塞其他页。扫描页没有成功转录时不以要点伪造原文，可在模型恢复后重新导入。
+
 ## 模型配置
 
 默认 `.env.example` 使用 `MODEL_PROVIDER=none`，无需密钥即可完成资料转换、规则章节划分、原文要点、讲义和题号规则抽取；对话提供当前页学习引导。规则结果会注明待核对，不冒充模型输出。
@@ -86,7 +101,7 @@ OPENAI_VISION_MODEL=your-vision-model
 
 不同任务可分配到不同通道：`CHAT_MODEL_PROVIDER`、`STRUCTURE_MODEL_PROVIDER`、`NOTES_MODEL_PROVIDER`、`TEXTBOOK_MODEL_PROVIDER`、`QUESTIONS_MODEL_PROVIDER`。对应的 `*_MODEL` 可覆盖文本模型名，`VISION_MODEL_PROVIDER` 单独选择视觉通道。通道还支持 `*_VISION_BASE_URL` / `*_VISION_API_KEY` / `*_VISION_MODEL`；没有可用视觉模型时使用文本。扫描页有视觉模型时进行转录，没有时保留页图并提示待补充。
 
-结构化响应使用 Zod 校验，失败重试一次，仍失败则记录失败任务；不会在已配置模型调用失败时悄悄改成规则内容。逐页公式进行 KaTeX 格式检查。Job 记录成功响应报告的 token 用量；不推算失败调用或不报告 usage 的用量。聊天通过 OpenAI 兼容 SSE 协议，支持停止、重试及交互题卡。
+结构化响应使用 Zod 校验；章节、讲义、习题失败重试一次，仍失败则记录失败任务。逐页 OCR / 要点失败重试 2 次后以 `rules:model-failed` 和“待核对”明确标记规则降级；无模型时为 `rules:no-model`。模型要点的标题、要点、关键词使用 `courses.language`（默认 `zh`），专业术语可括注英文，转录原文保留原语言。标题去除尾随标点，并要求模型根据内容拟题，页码占位标题会触发重试。逐页公式进行 KaTeX 格式检查。Job 记录成功响应报告的 token 用量；不推算失败调用或不报告 usage 的用量。聊天通过 OpenAI 兼容 SSE 协议，支持停止、重试及交互题卡。
 
 ## 数据与代码
 
@@ -116,9 +131,9 @@ npm run build
 npm run smoke:import
 ```
 
-Smoke 使用本地 HTTP mock 模型，自动启动隔离的 Next 服务和 worker，在 `data/smoke/<时间戳>/` 保存数据库、结果和浏览器截图，不使用真实模型凭据。已有生产构建时用 `next start`，否则使用开发服务。
+Smoke 使用本地 HTTP mock 模型，自动启动隔离的 Next 服务和 worker，将独立临时目录（系统临时目录下 `tap-smoke-*`，结束时输出位置）设为自己的 `DATA_DIR`，保存原创样例、数据库、结果和浏览器截图，不使用真实模型凭据或现有数据目录。已有生产构建时用 `next start`，否则使用开发服务。
 
-Smoke 会实际点击五步建课向导，用原创四页概率 PDF、同一教材 PDF 和一页习题 PDF 完整导入，检查页图、文本、知识点、要点、讲义、四种题型入库、课程渲染、SSE 对话、翻页、移动侧栏、审核以及笔记保存与隔离；再验证无模型教材 DOCX 导入，PPTX / PPT / DOC 转换和失败重试。
+Smoke 会实际点击五步建课向导，用原创四页概率 PDF、同一教材 PDF 和一页习题 PDF 完整导入，检查页图、文本、知识点、要点、讲义、四种题型入库、课程渲染、SSE 对话、翻页、移动侧栏、审核以及笔记保存与隔离；再验证无模型教材 DOCX 导入，PPTX / PPT / DOC 转换、单页模型失败降级和任务失败重试。
 
 浏览器验收使用 Playwright。已有 Google Chrome 时自动使用 `/opt/google/chrome/chrome`，也可指定 `CHROME_BIN`；其他环境先运行：
 

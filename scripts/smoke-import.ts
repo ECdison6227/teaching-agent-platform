@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, readFile, writeFile, access } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile, access } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import net from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium, expect } from "@playwright/test";
@@ -21,9 +22,9 @@ async function freePort() {
   return port;
 }
 async function main() {
-  const runDir = path.resolve(`data/smoke/${Date.now()}`);
-  await mkdir(runDir, { recursive: true });
-  const sampleDir = generateSamples();
+  const runDir = await mkdtemp(path.join(tmpdir(), "tap-smoke-"));
+  process.env.DATA_DIR = runDir;
+  const sampleDir = generateSamples(path.join(runDir, "samples"));
   const mock = await startMockModel();
   const port = await freePort(),
     basePath = process.env.NEXT_PUBLIC_BASE_PATH || "",
@@ -396,7 +397,7 @@ async function main() {
     console.log(
       "PASS fallback import: DOCX -> PDF -> PNG/text, textbook-only, rules notes/questions, deduplication, cross-course isolation",
     );
-    // PPTX/PPT/DOC 走真实办公文档转换；故意制造一次模型失败并重跑。
+    // PPTX/PPT/DOC 走真实转换；单页失败降级，结构化任务失败仍可重跑。
     const fodp = `<?xml version="1.0" encoding="UTF-8"?><office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.presentation"><office:body><office:presentation><draw:page draw:name="One"><draw:frame svg:x="2cm" svg:y="2cm" svg:width="20cm" svg:height="10cm"><draw:text-box><text:p>Original probability lesson</text:p><text:p>List outcomes before computing a probability.</text:p></draw:text-box></draw:frame></draw:page><draw:page draw:name="Two"><draw:frame svg:x="2cm" svg:y="2cm" svg:width="20cm" svg:height="10cm"><draw:text-box><text:p>Independent events</text:p><text:p>One fair toss does not change the next.</text:p></draw:text-box></draw:frame></draw:page></office:presentation></office:body></office:document>`;
     await writeFile(path.join(office, "slides.fodp"), fodp);
     for (const ext of ["pptx", "ppt"])
@@ -433,10 +434,20 @@ async function main() {
     await upload(third.id, "slides", path.join(office, "slides.pptx"));
     await upload(third.id, "material", path.join(office, "slides.ppt"));
     await upload(third.id, "material", path.join(office, "original.doc"));
-    const failedJob = await json<Job>(`/api/courses/${third.id}/jobs`, {
+    const degradedJob = await json<Job>(`/api/courses/${third.id}/jobs`, {
       method: "POST",
     });
     await runWorker({ OPENAI_VISION_MODEL: "mock-error" });
+    await checkJob(degradedJob.id);
+    const degraded = await json<CourseContent>(`/api/courses/${third.id}`);
+    assert.ok(
+      degraded.pages.every((p) => p.note?.model === "rules:model-failed"),
+    );
+    assert.ok(degraded.pages.every((p) => p.note?.qaStatus === "needs_review"));
+    const failedJob = await json<Job>(`/api/courses/${third.id}/jobs`, {
+      method: "POST",
+    });
+    await runWorker({ STRUCTURE_MODEL: "mock-error" });
     const failed = await json<Job>(`/api/jobs/${failedJob.id}`);
     assert.equal(failed.status, "failed");
     assert.match(failed.error || "", /429/);
@@ -452,7 +463,7 @@ async function main() {
     );
     assert.ok(officeCourse.pages.every((p) => p.rawText.length > 10));
     console.log(
-      "PASS office/retry: PPTX + PPT + DOC -> PDF, failed job recorded, reimport replaces partial data",
+      "PASS office/retry: PPTX + PPT + DOC -> PDF, page model failure degrades to rules, failed structure job recorded, reimport replaces partial data",
     );
     await writeFile(
       path.join(runDir, "result.json"),
