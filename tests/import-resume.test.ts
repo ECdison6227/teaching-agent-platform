@@ -31,6 +31,7 @@ process.env.OPENAI_BASE_URL = "http://model.test/v1";
 process.env.OPENAI_CHAT_MODEL = "resume-test";
 process.env.OPENAI_VISION_MODEL = "";
 process.env.MODEL_RETRY_BASE_MS = "1";
+process.env.IMPORT_QUESTION_BATCH = "6";
 const fetchBefore = globalThis.fetch;
 after(async () => {
   globalThis.fetch = fetchBefore;
@@ -98,6 +99,8 @@ test("从讲义和习题写入故障续跑，保留页图/原文/审核内容并
     const body = JSON.parse(init!.body as string);
     const task = body.messages[0].content.match(/TASK:(\w+)/)[1];
     const prompt = body.messages[1].content;
+    if (prompt.includes("步骤：答案推导"))
+      return response('{"answer":null,"analysis":"Insufficient context"}');
     calls.push(
       task === "textbook"
         ? `${task}:${prompt.match(/知识点 (K\d+)/)[1]}`
@@ -110,17 +113,17 @@ test("从讲义和习题写入故障续跑，保留页图/原文/审核内容并
       );
     if (task === "textbook")
       return response(String.raw`{"content_md":"Formula $\alpha+\beta$."}`);
-    const page = Number(prompt.match(/原文：\[\{"page":(\d+)/)[1]);
+    const original = JSON.parse(prompt.split("\n原文：")[1]);
     return response(
       JSON.stringify({
-        questions: [
-          {
-            type: "short",
-            prompt: `Original exercise ${page}`,
-            sourcePage: page,
-            pages: [],
-          },
-        ],
+        questions: original.map((q: { page: number; id: string }) => ({
+          type: "short",
+          prompt: `Original exercise ${q.page}`,
+          sourceQuestionId: q.id,
+          sourcePage: q.page,
+          answer: "Source answer",
+          pages: [],
+        })),
       }),
     );
   };
@@ -138,6 +141,7 @@ test("从讲义和习题写入故障续跑，保留页图/原文/审核内容并
     makePdf(
       Array.from({ length: 7 }, (_, i) => [
         `QUESTION ${i + 1}. Explain the concept.`,
+        "Answer: Source answer",
       ]),
     ),
   );
@@ -174,7 +178,7 @@ test("从讲义和习题写入故障续跑，保留页图/原文/审核内容并
     "questions",
     "questions",
   ]);
-  assert.equal(partial.questions.length, 1);
+  assert.equal(partial.questions.length, 6);
   assert.equal(
     partial.importItems.filter((i) => i.key.startsWith("questions:")).length,
     1,
@@ -188,7 +192,7 @@ test("从讲义和习题写入故障续跑，保留页图/原文/审核内容并
   assert.deepEqual(calls.slice(secondBefore), ["questions"]);
   assert.deepEqual(resumed.pages, partial.pages);
   assert.deepEqual(resumed.knowledgePoints, partial.knowledgePoints);
-  assert.equal(resumed.questions.length, 2);
+  assert.equal(resumed.questions.length, 7);
   assert.equal(resumed.questions[0].id, partial.questions[0].id);
   assert.deepEqual(
     await Promise.all(
@@ -216,7 +220,7 @@ test("从讲义和习题写入故障续跑，保留页图/原文/审核内容并
   assert.equal(courseContent(other.id).jobs[0].id, otherJob.id);
   assert.equal(courseContent(other.id).jobs[0].status, "queued");
   assert.deepEqual(courseContent(course.id).pages, resumed.pages);
-  assert.equal(courseContent(course.id).questions.length, 2);
+  assert.equal(courseContent(course.id).questions.length, 7);
   assert.equal(courseContent(course.id).jobs[0].costTokens, 0);
 });
 test("所有模型步骤持续非法 JSON 时逐项降级并标待核对，空习题批次也有检查点", async () => {
@@ -269,6 +273,8 @@ test("单项讲义和习题批次最终解析失败后仍处理后续项", async
     const body = JSON.parse(init!.body as string);
     const task = body.messages[0].content.match(/TASK:(\w+)/)[1];
     const prompt = body.messages[1].content;
+    if (prompt.includes("步骤：答案推导"))
+      return response('{"answer":null,"analysis":"Insufficient context"}');
     let key = task;
     if (task === "textbook") key += ":" + prompt.match(/知识点 (K\d+)/)[1];
     if (task === "questions")
@@ -319,7 +325,9 @@ test("单项讲义和习题批次最终解析失败后仍处理后续项", async
     result.questions.some((q) => q.prompt === "Final original exercise"),
   );
   assert.equal(
-    result.importItems.filter((i) => i.status === "needs_review").length,
+    result.importItems.filter(
+      (i) => i.status === "needs_review" && !i.key.startsWith("answers:"),
+    ).length,
     2,
   );
 });

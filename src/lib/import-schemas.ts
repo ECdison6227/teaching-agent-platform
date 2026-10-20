@@ -32,28 +32,31 @@ export const TextbookSchema = z.object({
 export const QuestionsSchema = z.object({
   questions: z
     .array(
-      z
-        .object({
-          type: z.enum(["choice", "truefalse", "fill", "short"]),
-          prompt: z.string().min(1).max(10000),
-          options: z
-            .array(
-              z.object({ id: z.string().max(10), text: z.string().max(3000) }),
-            )
-            .min(2)
-            .max(12)
-            .optional(),
-          answer: z.string().max(5000).nullable().optional(),
-          analysis: z.string().max(10000).optional(),
-          kpCode: z.string().max(20).optional(),
-          pages: z.array(z.number().int().positive()).max(30).default([]),
-          sourcePage: z.number().int().positive().optional(),
-          confidence: z.enum(["high", "mid", "low"]).default("low"),
-        })
-        .superRefine((q, ctx) => {
-          if (q.type === "choice" && !q.options)
-            ctx.addIssue({ code: "custom", message: "选择题必须包含选项" });
-        }),
+      z.object({
+        type: z.enum(["choice", "truefalse", "fill", "calc", "short"]),
+        prompt: z.string().min(1).max(10000),
+        options: z
+          .array(
+            z.object({ id: z.string().max(10), text: z.string().max(3000) }),
+          )
+          .min(2)
+          .max(12)
+          .optional(),
+        answer: z.string().max(5000).nullable().optional(),
+        analysis: z.string().max(10000).optional(),
+        sourceQuestionId: z.string().max(40).optional(),
+        kpId: z.string().max(100).nullable().default(null),
+        kpConfidence: z.number().min(0).max(1).default(0),
+        kpCode: z.string().max(20).optional(),
+        pages: z.array(z.number().int().positive()).max(30).default([]),
+        sourcePage: z.number().int().positive().optional(),
+        confidence: z.enum(["high", "mid", "low"]).default("low"),
+      }),
     )
     .max(200),
+});
+
+export const QuestionAnswerSchema = z.object({
+  answer: z.string().trim().min(1).max(5000).nullable(),
+  analysis: z.string().min(1).max(10000),
 });

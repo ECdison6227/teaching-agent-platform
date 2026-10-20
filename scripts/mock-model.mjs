@@ -72,7 +72,18 @@ export async function startMockModel(port = 0) {
           content_md:
             "## 从样本空间理解概率\n\n先列出可能结果，等可能情况下 $P(A)=|A|/|S|$。例如公平硬币出现正面的概率为 $1/2$。独立试验互不改变概率。",
         };
-      else if (task === "questions")
+      else if (
+        task === "questions" &&
+        body.messages[1].content.includes("步骤：答案推导")
+      )
+        content = {
+          answer: null,
+          analysis: "此开放题需结合个人例子，留待教师补充。",
+        };
+      else if (task === "questions") {
+        const originals = JSON.parse(
+          body.messages[1].content.split("\n原文：")[1],
+        );
         content = {
           questions: [
             {
@@ -118,7 +129,18 @@ export async function startMockModel(port = 0) {
             },
           ],
         };
-      else
+        content.questions = content.questions.map((q, i) => ({
+          ...q,
+          sourceQuestionId: originals[i]?.id,
+          kpId:
+            i === 3
+              ? null
+              : originals[i]?.candidates.find((k) =>
+                  k.pagePoints.some((p) => q.pages.includes(p.page)),
+                )?.kpId || null,
+          kpConfidence: i === 3 ? 0 : 0.95,
+        }));
+      } else
         content =
           '我们先列出公平硬币的样本空间：正面和反面。正面占两个等可能结果中的一个。\n\n```slides\n2\n```\n\n```card\n{"kind":"choice","prompt":"公平硬币出现正面的概率是多少？","options":[{"id":"A","text":"0.5"},{"id":"B","text":"1"}],"topic":"K1"}\n```';
       if (body.stream) {

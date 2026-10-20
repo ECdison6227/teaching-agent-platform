@@ -7,6 +7,22 @@ function positiveInteger(name: string, fallback: number) {
     : fallback;
 }
 
+export function importQuestionBatch() {
+  return Math.min(100, positiveInteger("IMPORT_QUESTION_BATCH", 10));
+}
+export function importQuestionConcurrency() {
+  return Math.min(16, positiveInteger("IMPORT_QUESTION_CONCURRENCY", 4));
+}
+export function importQuestionKpThreshold() {
+  const value = Number(process.env.IMPORT_QUESTION_KP_THRESHOLD);
+  return process.env.IMPORT_QUESTION_KP_THRESHOLD?.trim() &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    value <= 1
+    ? value
+    : 0.7;
+}
+
 export function importPageConcurrency() {
   return Math.min(16, positiveInteger("IMPORT_PAGE_CONCURRENCY", 4));
 }
@@ -42,13 +58,14 @@ export async function mapImportPages<T, R>(
   items: readonly T[],
   work: (item: T, index: number) => Promise<R>,
   onComplete: (completed: number) => void,
+  concurrency = importPageConcurrency(),
 ): Promise<R[]> {
   const results = new Array<R>(items.length);
   let next = 0;
   let completed = 0;
   let failed = false;
   const workers = Array.from(
-    { length: Math.min(importPageConcurrency(), items.length) },
+    { length: Math.min(concurrency, items.length) },
     async () => {
       while (!failed && next < items.length) {
         const index = next++;

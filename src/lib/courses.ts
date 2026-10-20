@@ -2,7 +2,7 @@ import { ulid } from "ulid";
 import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, like, or } from "drizzle-orm";
 import { z } from "zod";
 import { database } from "../db";
 import {
@@ -262,9 +262,92 @@ export function enqueueImport(courseId: string) {
         .set({ status: "importing" })
         .where(eq(courses.id, courseId))
         .run();
+      const previous = db
+        .select()
+        .from(jobs)
+        .where(eq(jobs.courseId, courseId))
+        .orderBy(desc(jobs.createdAt))
+        .get();
       return db
         .insert(jobs)
-        .values({ id: uid(), courseId, createdAt: now() })
+        .values({
+          id: uid(),
+          courseId,
+          createdAt: now(),
+          type: previous?.status === "failed" ? previous.type : "import",
+        })
+        .returning()
+        .get();
+    })
+    .immediate();
+}
+
+/** Atomically reset only automatic question data and claim the targeted job.
+ * A live worker never sees an unclaimed reset job; no process is stopped. */
+export function restartQuestionSteps(
+  courseId: string,
+  from: "questions" | "answers",
+) {
+  const { db, sqlite } = database();
+  return sqlite
+    .transaction(() => {
+      getCourse(courseId);
+      if (activeJob(courseId))
+        throw new HttpError(
+          409,
+          "课程已有活跃导入任务，请在任务完成后重跑习题；未修改任何内容",
+        );
+      if (
+        !db.select().from(pages).where(eq(pages.courseId, courseId)).get() ||
+        !db
+          .select()
+          .from(knowledgePoints)
+          .where(eq(knowledgePoints.courseId, courseId))
+          .get()
+      )
+        throw new HttpError(400, "请先完成课程页面与知识点导入");
+      if (from === "questions") {
+        for (const q of db
+          .select()
+          .from(questions)
+          .where(eq(questions.courseId, courseId))
+          .all()) {
+          if (q.source === "generated") continue;
+          db.delete(questions)
+            .where(
+              and(eq(questions.courseId, courseId), eq(questions.id, q.id)),
+            )
+            .run();
+        }
+        db.delete(importItems)
+          .where(
+            and(
+              eq(importItems.courseId, courseId),
+              or(
+                like(importItems.key, "questions:%"),
+                like(importItems.key, "answers:%"),
+              ),
+            ),
+          )
+          .run();
+      }
+      db.update(courses)
+        .set({ status: "importing" })
+        .where(eq(courses.id, courseId))
+        .run();
+      return db
+        .insert(jobs)
+        .values({
+          id: uid(),
+          courseId,
+          type: `import:${from}`,
+          status: "running",
+          createdAt: now(),
+          startedAt: now(),
+          heartbeatAt: now(),
+          step: from === "questions" ? "重抽习题" : "续跑答案推导",
+          progress: 1,
+        })
         .returning()
         .get();
     })

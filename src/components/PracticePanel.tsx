@@ -21,6 +21,9 @@ export function PracticePanel({ question }: { question: Question }) {
       <CardHeader>
         <CardDescription>
           {question.code} · {question.verified ? "答案已核对" : "待核对"}
+          {!question.kpId && " · 未关联"}
+          {question.answerMethod === "consensus" && " · 两轮推导一致"}
+          {question.answerMethod === "arbitrated" && " · 仲裁待核对"}
         </CardDescription>
         <CardTitle className="text-base leading-7">
           <Markdown text={question.prompt} />
@@ -39,7 +42,7 @@ export function PracticePanel({ question }: { question: Question }) {
                 setSubmitted(false);
               }}
             >
-              {o.id}. {o.text}
+              {o.id}. <Markdown text={o.text} />
             </Button>
           ))}
         {question.type === "truefalse" && (

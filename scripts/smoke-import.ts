@@ -194,13 +194,13 @@ async function main() {
     assert.ok(
       content.questions.every(
         (q) =>
-          q.kpId &&
-          q.pageIds.length &&
+          (q.kpId ? q.pageIds.length : !q.pageIds.length) &&
           !q.verified &&
           q.reviewStatus === "needs_review",
       ),
     );
     assert.ok(content.questions.some((q) => !q.answer));
+    assert.ok(content.questions.some((q) => !q.kpId));
     assert.ok(content.knowledgePoints.every((k) => k.contentMd.length));
     assert.ok(content.knowledgePoints.some((k) => !k.hasSlides));
     for (const p of content.pages) {
@@ -300,6 +300,7 @@ async function main() {
       .first()
       .click();
     await expect(page.getByText("回答正确", { exact: true })).toBeVisible();
+    await expect(page.getByText(/未关联/).first()).toBeVisible();
     const missingAnswer = revised.questions.find((q) => !q.answer)!;
     const invalidVerification = await fetch(
       base + `/api/courses/${course.id}/review`,

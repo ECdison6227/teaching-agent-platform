@@ -1,6 +1,7 @@
 import {
   index,
   integer,
+  real,
   sqliteTable,
   text,
   uniqueIndex,
@@ -132,9 +133,13 @@ export const questions = sqliteTable(
     >(),
     answer: text("answer"),
     analysis: text("analysis"),
-    kpId: text("kp_id")
-      .notNull()
-      .references(() => knowledgePoints.id, { onDelete: "cascade" }),
+    kpId: text("kp_id").references(() => knowledgePoints.id, {
+      onDelete: "set null",
+    }),
+    kpConfidence: real("kp_confidence").notNull().default(0),
+    answerMethod: text("answer_method", {
+      enum: ["source", "consensus", "arbitrated"],
+    }),
     pageIds: text("page_ids", { mode: "json" }).$type<string[]>().notNull(),
     source: text("source", { mode: "json" })
       .$type<{ sourceId: string; page?: number } | "generated">()

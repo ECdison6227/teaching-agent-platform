@@ -18,7 +18,6 @@ import {
   knowledgePoints,
   pages,
   pageNotes,
-  questions,
   jobs,
   importItems,
   type Source,
@@ -31,12 +30,10 @@ import {
   type ModelTask,
   type ModelMetrics,
 } from "./models/provider";
-import {
-  PageNoteSchema,
-  QuestionsSchema,
-  TextbookSchema,
-} from "./import-schemas";
+import { PageNoteSchema, TextbookSchema } from "./import-schemas";
 import { z } from "zod";
+import { runQuestionExtraction, runQuestionAnswers } from "./import-questions";
+import { questionBoundaries, ruleQuestion } from "./question-parser";
 import { command } from "./import-command";
 import { mapImportPages, importPageConcurrency } from "./import-settings";
 import { generatePageNote, pageTitle } from "./import-page-notes";
@@ -130,6 +127,7 @@ export function claimJob(courseId?: string) {
         .where(
           and(
             eq(jobs.status, "running"),
+            courseId ? eq(jobs.courseId, courseId) : undefined,
             lt(jobs.heartbeatAt, new Date(Date.now() - 300_000).toISOString()),
           ),
         )
@@ -220,6 +218,57 @@ export async function importJob(jobId: string) {
       .from(courses)
       .where(eq(courses.id, courseId))
       .get()!;
+    if (job.type === "import:questions" || job.type === "import:answers") {
+      const hooks = {
+        progress,
+        tokens: (amount: number) => {
+          tokens += amount;
+        },
+      };
+      if (job.type === "import:questions") {
+        const questionSources = db
+          .select()
+          .from(sources)
+          .where(
+            and(
+              eq(sources.courseId, courseId),
+              eq(sources.kind, "question_bank"),
+            ),
+          )
+          .all();
+        const texts = [];
+        for (const source of questionSources) {
+          if (!source.textKey)
+            throw new Error("习题原文缓存缺失，请先完成资料导入");
+          const text = await readFile(storagePath(source.textKey), "utf8");
+          texts.push({
+            sourceId: source.id,
+            pages: text.split(/\f/).map((text) => ({ text })),
+          });
+        }
+        await runQuestionExtraction(courseId, texts, hooks);
+      }
+      await runQuestionAnswers(courseId, hooks);
+      db.transaction((tx) => {
+        tx.update(courses)
+          .set({ status: "ready" })
+          .where(eq(courses.id, courseId))
+          .run();
+        tx.update(jobs)
+          .set({
+            status: "done",
+            progress: 100,
+            step: "习题步骤完成",
+            costTokens: tokens,
+            finishedAt: now(),
+            heartbeatAt: now(),
+            error: null,
+          })
+          .where(eq(jobs.id, jobId))
+          .run();
+      });
+      return;
+    }
     const language = course.language?.trim() || "zh";
     const input = db
       .select()
@@ -724,121 +773,20 @@ export async function importJob(jobId: string) {
         );
       });
     }
-    const questionSources = parsed.filter(
-      (s) => s.source.kind === "question_bank",
+    const questionHooks = {
+      progress,
+      tokens: (amount: number) => {
+        tokens += amount;
+      },
+    };
+    await runQuestionExtraction(
+      courseId,
+      parsed
+        .filter((s) => s.source.kind === "question_bank")
+        .map((s) => ({ sourceId: s.source.id, pages: s.pages })),
+      questionHooks,
     );
-    let questionNumber = db
-      .select()
-      .from(questions)
-      .where(eq(questions.courseId, courseId))
-      .all()
-      .reduce(
-        (max, q) => Math.max(max, Number(q.code.replace(/^Q-/, "")) || 0),
-        0,
-      );
-    for (const [qi, source] of questionSources.entries()) {
-      // 分批抽取，避免长题库静默截断。
-      for (let start = 0; start < source.pages.length; start += 6) {
-        const itemKey = `questions:${source.source.id}:${start}`;
-        if (completedItem(itemKey)) continue;
-        progress(
-          81 + Math.round((qi / Math.max(1, questionSources.length)) * 13),
-          `抽取习题：资料 ${qi + 1} · ${start + 1} 页起`,
-        );
-        const chunk = source.pages.slice(start, start + 6);
-        const extracted = await optionalModel(
-          "questions",
-          QuestionsSchema,
-          `只抽取原文已有习题，不编题、不推导缺失答案。返回 {"questions":[{"type":"choice|truefalse|fill|short","prompt":"题干","options":[{"id":"A","text":"选项"}],"answer":null,"analysis":"原文解析","kpCode":"K1","pages":[1],"sourcePage":1,"confidence":"high|mid|low"}]}。options 仅选择题。answer 缺失必须 null；判断题答案用 T/F。pages 指课件页码；sourcePage 为原资料页码。知识点索引：${JSON.stringify(kps.map((k) => ({ code: k.code, title: k.title, pages: k.pageNumbers })))}\n原文：${JSON.stringify(chunk.map((p, i) => ({ page: start + i + 1, text: p.text.slice(0, 12000) })))}`,
-        );
-        tokens += extracted?.tokens || 0;
-        const items =
-          extracted?.data.questions ||
-          fallbackQuestions(chunk.map((p) => p.text).join("\n"));
-        db.transaction((tx) => {
-          for (const q of items) {
-            const kp =
-              kps.find((k) => k.code === q.kpCode) ||
-              kps.find((k) =>
-                k.keywords.some((word) => q.prompt.includes(word)),
-              ) ||
-              kps[0];
-            let linked = persistedPages.filter(
-              (p) => p.kpId === kp.id && q.pages.includes(p.index),
-            );
-            if (!linked.length)
-              linked = persistedPages
-                .filter((p) => p.kpId === kp.id)
-                .slice(0, 1);
-            let answer = q.answer?.trim() || null;
-            if (
-              q.type === "choice" &&
-              answer &&
-              !q.options?.some(
-                (o) => o.id.toUpperCase() === answer!.toUpperCase(),
-              )
-            )
-              answer = null;
-            if (
-              q.type === "truefalse" &&
-              answer &&
-              !["T", "F"].includes(answer.toUpperCase())
-            )
-              answer = null;
-            // Legacy jobs may have committed part of a batch before checkpoints existed.
-            const duplicate = tx
-              .select()
-              .from(questions)
-              .where(
-                and(
-                  eq(questions.courseId, courseId),
-                  eq(questions.prompt, redactPII(q.prompt)),
-                ),
-              )
-              .all()
-              .some(
-                (existing) =>
-                  existing.source !== "generated" &&
-                  existing.source.sourceId === source.source.id &&
-                  existing.source.page === (q.sourcePage || start + 1),
-              );
-            if (duplicate) continue;
-            tx.insert(questions)
-              .values({
-                id: uid(),
-                courseId,
-                code: `Q-${String(++questionNumber).padStart(3, "0")}`,
-                type: q.type,
-                prompt: redactPII(q.prompt),
-                options: q.options?.map((o) => ({
-                  ...o,
-                  text: redactPII(o.text),
-                })),
-                answer: answer ? redactPII(answer) : null,
-                analysis: redactPII(q.analysis || ""),
-                kpId: kp.id,
-                pageIds: linked.map((p) => p.id),
-                source: {
-                  sourceId: source.source.id,
-                  page:
-                    q.sourcePage && q.sourcePage <= source.pages.length
-                      ? q.sourcePage
-                      : start + 1,
-                },
-                confidence: extracted ? q.confidence : "low",
-                verified: false,
-                reviewStatus: "needs_review",
-              })
-              .run();
-          }
-          markItem(
-            itemKey,
-            !!extracted,
-            `习题资料 ${qi + 1} 第 ${start + 1}–${Math.min(start + 6, source.pages.length)} 页使用规则抽取，待核对`,
-          );
-        });
-      }
-    }
+    await runQuestionAnswers(courseId, questionHooks);
     progress(97, "检查课程完整性");
     if (persistedPages.length !== allPages.length || !kps.length)
       throw new Error("课程完整性检查失败");
@@ -891,36 +839,9 @@ export async function importJob(jobId: string) {
   }
 }
 
-/** 无模型时仅按题号/QUESTION 分段抽原文，保留缺失答案，绝不伪造模型结果。 */
-export function fallbackQuestions(
-  text: string,
-): z.infer<typeof QuestionsSchema>["questions"] {
-  return text
-    .split(/(?=^\s*(?:\d+[.、)]|Q\d+[.:]|QUESTION\s+\d+))/gim)
-    .map((s) => s.trim())
-    .filter((s) => /^(?:\d+[.、)]|Q\d+[.:]|QUESTION\s+\d+)/i.test(s))
-    .slice(0, 200)
-    .map((raw) => {
-      const answer =
-        raw.match(/(?:答案|Answer)\s*[:：]\s*([^\n]+)/i)?.[1]?.trim() || null;
-      const prompt = raw.replace(/(?:答案|Answer)\s*[:：][\s\S]*/i, "").trim();
-      const options = [...prompt.matchAll(/^\s*([A-D])[.、)]\s*(.+)$/gm)].map(
-        (m) => ({ id: m[1], text: m[2] }),
-      );
-      return {
-        type:
-          options.length >= 2
-            ? "choice"
-            : /_{2,}/.test(prompt)
-              ? "fill"
-              : /true\s*\/\s*false|判断/i.test(prompt)
-                ? "truefalse"
-                : "short",
-        prompt,
-        options: options.length >= 2 ? options : undefined,
-        answer,
-        confidence: "low",
-        pages: [],
-      };
-    });
+/** 无模型时按题目边界抽取原文，答案仅保留原文提供的内容。 */
+export function fallbackQuestions(text: string) {
+  return questionBoundaries([{ text }])
+    .filter((q) => q.numbered)
+    .map(ruleQuestion);
 }

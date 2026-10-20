@@ -226,6 +226,9 @@ export function ReviewDesk({ initial }: { initial: CourseContent }) {
             <CardHeader>
               <CardTitle>
                 {q.code} · {q.verified ? "已核对" : "待核对"}
+                {!q.kpId && " · 未关联"}
+                {q.answerMethod === "consensus" && " · 两轮推导一致"}
+                {q.answerMethod === "arbitrated" && " · 仲裁待核对"}
               </CardTitle>
               <CardDescription className="whitespace-pre-wrap">
                 {q.prompt}
