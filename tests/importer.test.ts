@@ -26,6 +26,7 @@ import { makePdf } from "../scripts/generate-samples.mjs";
 
 const dir = await mkdtemp(path.join(tmpdir(), "tap-import-test-"));
 process.env.DATA_DIR = dir;
+process.env.MODEL_RETRY_BASE_MS = "1";
 
 /** 原创纯图像 PDF，每页有不同颜色，无字体或文本层。 */
 function scannedPdf(count: number) {
@@ -106,7 +107,7 @@ const server = http.createServer(async (req, res) => {
     const task = body.messages[0].content.match(/TASK:(\w+)/)?.[1];
     let content: unknown;
     if (task === "notes") {
-      const input = body.messages.at(-1).content;
+      const input = body.messages[1].content;
       const prompt = typeof input === "string" ? input : input[0].text;
       scenario.prompts.push(prompt);
       let page = Number(prompt.match(/Marker (\d+)/)?.[1]);
@@ -293,8 +294,8 @@ for (const kind of ["text", "scan"] as const) {
       assert.equal(scenario.attempts.get(1), 2, "页码占位标题触发重试");
       assert.equal(
         scenario.attempts.get(3),
-        3,
-        "永久失败仅尝试三次且不重跑 OCR",
+        4,
+        "永久网络失败重试三次且不重跑 OCR",
       );
       assert.equal(scenario.attempts.get(4), 3, "两次失败后第三次恢复");
       assert.equal(scenario.attempts.get(5), 2, "无标题或漏转录会重试");

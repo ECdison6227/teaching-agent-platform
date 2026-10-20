@@ -1,8 +1,15 @@
-import { mkdir, readFile, writeFile, copyFile, rm } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  writeFile,
+  copyFile,
+  rm,
+  access,
+} from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import katex from "katex";
-import { and, eq, lt } from "drizzle-orm";
+import { and, eq, lt, asc } from "drizzle-orm";
 import { database } from "../db";
 import {
   courses,
@@ -13,33 +20,82 @@ import {
   pageNotes,
   questions,
   jobs,
+  importItems,
   type Source,
 } from "../db/schema";
 import { now, uid } from "./courses";
 import { storagePath, redactPII, courseDir } from "./storage";
-import { structured, resolveProviderConfig } from "./models/provider";
+import {
+  structured,
+  resolveProviderConfig,
+  type ModelTask,
+  type ModelMetrics,
+} from "./models/provider";
 import {
   PageNoteSchema,
   QuestionsSchema,
-  StructureSchema,
   TextbookSchema,
 } from "./import-schemas";
 import { z } from "zod";
 import { command } from "./import-command";
-import { mapImportPages } from "./import-settings";
-import {
-  generatePageNote,
-  pageTitle,
-  type PageNoteResult,
-} from "./import-page-notes";
+import { mapImportPages, importPageConcurrency } from "./import-settings";
+import { generatePageNote, pageTitle } from "./import-page-notes";
 
-type ParsedPage = {
-  text: string;
-  imageKey: string;
-  width: number;
-  height: number;
-  cachedNote?: PageNoteResult;
-};
+import { cachePage, readCachedPage, type ParsedPage } from "./import-cache";
+import {
+  knowledgePointRange,
+  fallbackKnowledgePointTitle,
+  structurePrompt,
+  structureSchema,
+} from "./import-structure";
+
+async function optionalModel<S extends z.ZodTypeAny>(
+  task: ModelTask,
+  schema: S,
+  input: string,
+) {
+  try {
+    return await structured(task, schema, input);
+  } catch (error) {
+    console.warn(
+      JSON.stringify({
+        event: "import_model_fallback",
+        task,
+        error: error instanceof Error ? error.message : "模型返回无效内容",
+      }),
+    );
+    return null;
+  }
+}
+function logPage(
+  jobId: string,
+  courseId: string,
+  sourceId: string,
+  page: number,
+  phase: string,
+  started: number,
+  metrics?: ModelMetrics,
+  writeMs = 0,
+) {
+  console.info(
+    JSON.stringify({
+      event: "import_page",
+      jobId,
+      courseId,
+      sourceId,
+      page,
+      phase,
+      elapsedMs: Math.round(performance.now() - started),
+      requests: metrics?.requests || 0,
+      networkRetries: metrics?.networkRetries || 0,
+      parseRetries: metrics?.parseRetries || 0,
+      rateLimits: metrics?.rateLimits || 0,
+      serverErrors: metrics?.serverErrors || 0,
+      modelMs: metrics?.elapsedMs || 0,
+      writeMs: Math.round(writeMs * 100) / 100,
+    }),
+  );
+}
 type ParsedSource = { source: Source; pages: ParsedPage[] };
 function qaNote(note: z.infer<typeof PageNoteSchema>, ruleBased = false) {
   if (ruleBased) return "needs_review" as const;
@@ -58,15 +114,16 @@ function qaNote(note: z.infer<typeof PageNoteSchema>, ruleBased = false) {
   }
 }
 /** 原子领取：Web 与多个 worker 使用同一个 SQLite 队列。 */
-export function claimJob() {
+export function claimJob(courseId?: string) {
   const { db, sqlite } = database();
   return sqlite
     .transaction(() => {
       // 心跳每 10 秒更新；进程意外退出后，过期任务标记失败，可由界面重试。
-      db.update(jobs)
+      const expired = db
+        .update(jobs)
         .set({
           status: "failed",
-          error: "worker 心跳已过期，请重新导入",
+          error: "worker 心跳已过期，可从失败处继续",
           step: "导入中断",
           finishedAt: now(),
         })
@@ -76,11 +133,21 @@ export function claimJob() {
             lt(jobs.heartbeatAt, new Date(Date.now() - 300_000).toISOString()),
           ),
         )
-        .run();
+        .returning()
+        .all();
+      for (const job of expired)
+        db.update(courses)
+          .set({ status: "failed" })
+          .where(eq(courses.id, job.courseId))
+          .run();
       const row = db
         .select()
         .from(jobs)
-        .where(eq(jobs.status, "queued"))
+        .where(
+          courseId
+            ? and(eq(jobs.status, "queued"), eq(jobs.courseId, courseId))
+            : eq(jobs.status, "queued"),
+        )
         .orderBy(jobs.createdAt)
         .get();
       if (!row) return null;
@@ -114,6 +181,23 @@ export async function importJob(jobId: string) {
     throw new Error("任务必须先由 worker 领取");
   const courseId = job.courseId;
   let tokens = 0;
+  const completedItem = (key: string) =>
+    db
+      .select()
+      .from(importItems)
+      .where(and(eq(importItems.courseId, courseId), eq(importItems.key, key)))
+      .get();
+  const markItem = (key: string, ok: boolean, message: string) =>
+    db
+      .insert(importItems)
+      .values({
+        courseId,
+        key,
+        status: ok ? "done" : "needs_review",
+        message: ok ? null : message,
+      })
+      .onConflictDoNothing()
+      .run();
   const progress = (value: number, step: string) =>
     db
       .update(jobs)
@@ -142,15 +226,33 @@ export async function importJob(jobId: string) {
       .from(sources)
       .where(eq(sources.courseId, courseId))
       .all();
-    // 重跑替换派生内容，保留上传原件。失败课程不会发布。
-    db.transaction((tx) => {
-      tx.delete(pages).where(eq(pages.courseId, courseId)).run();
-      tx.delete(chapters).where(eq(chapters.courseId, courseId)).run();
-      tx.update(sources)
-        .set({ status: "processing" })
-        .where(eq(sources.courseId, courseId))
-        .run();
-    });
+    console.info(
+      JSON.stringify({
+        event: "import_start",
+        jobId,
+        courseId,
+        pageConcurrency: importPageConcurrency(),
+      }),
+    );
+    db.update(courses)
+      .set({ status: "importing" })
+      .where(eq(courses.id, courseId))
+      .run();
+    const existingPages = db
+      .select()
+      .from(pages)
+      .where(eq(pages.courseId, courseId))
+      .all();
+    const primaryIds = new Set(
+      input
+        .filter(
+          (source) =>
+            source.kind ===
+            (input.some((s) => s.kind === "slides") ? "slides" : "textbook"),
+        )
+        .map((source) => source.id),
+    );
+    let primaryOffset = 0;
     courseDir(courseId);
     let totalPages = 0;
     const parsed: ParsedSource[] = [];
@@ -165,9 +267,13 @@ export async function importJob(jobId: string) {
       );
       const pdfKey = `${folderKey}/document.pdf`,
         pdf = storagePath(pdfKey);
-      if (source.mime === "application/pdf")
+      const pdfExists = await access(pdf).then(
+        () => true,
+        () => false,
+      );
+      if (!pdfExists && source.mime === "application/pdf")
         await copyFile(storagePath(source.storageKey), pdf);
-      else {
+      else if (!pdfExists) {
         const profile = path.join(folder, "lo-profile");
         await command("soffice", [
           `-env:UserInstallation=${pathToFileURL(profile).href}`,
@@ -188,63 +294,138 @@ export async function importJob(jobId: string) {
         );
         await rm(profile, { recursive: true, force: true });
       }
-      const info = await command("pdfinfo", [pdf]);
-      const count = Number(info.stdout.match(/^Pages:\s+(\d+)/m)?.[1]);
+      const count =
+        source.pages > 0 && pdfExists
+          ? source.pages
+          : Number(
+              (await command("pdfinfo", [pdf])).stdout.match(
+                /^Pages:\s+(\d+)/m,
+              )?.[1],
+            );
       if (!count) throw new Error("PDF 页数为空或不可读取");
       totalPages += count;
       if (totalPages > 500)
         throw new Error("MVP 单课程总页数上限为 500，请拆分课程资料");
+      db.update(sources)
+        .set({ pdfKey, pages: count, status: "processing" })
+        .where(and(eq(sources.id, source.id), eq(sources.courseId, courseId)))
+        .run();
+      const offset = primaryOffset;
+      if (primaryIds.has(source.id)) primaryOffset += count;
       const sourcePages = await mapImportPages(
         Array.from({ length: count }, (_, i) => i + 1),
         async (i): Promise<ParsedPage> => {
+          const started = performance.now();
           const imageKey = `${folderKey}/page-${i}.png`,
-            textFile = path.join(folder, `page-${i}.txt`);
-          await command("pdftoppm", [
-            "-f",
-            String(i),
-            "-l",
-            String(i),
-            "-singlefile",
-            "-scale-to",
-            "1400",
-            "-png",
-            pdf,
-            storagePath(imageKey).slice(0, -4),
-          ]);
-          await command("pdftotext", [
-            "-f",
-            String(i),
-            "-l",
-            String(i),
-            "-layout",
-            "-enc",
-            "UTF-8",
-            pdf,
-            textFile,
-          ]);
-          let text = redactPII(
-            (await readFile(textFile, "utf8")).replace(/\f/g, "").trim(),
+            textFile = path.join(folder, `page-${i}.txt`),
+            cacheKey = `${folderKey}/page-${i}.json`;
+          const existing = existingPages.find(
+            (p) => p.sourceId === source.id && p.sourcePage === i,
           );
-          const bytes = await readFile(storagePath(imageKey));
-          const page: ParsedPage = {
-            text,
-            imageKey,
-            width: bytes.readUInt32BE(16),
-            height: bytes.readUInt32BE(20),
-          };
-          if (!text && resolveProviderConfig("notes", true)) {
-            const result = await generatePageNote({
-              text,
-              language,
-              image: `data:image/png;base64,${bytes.toString("base64")}`,
-              transcribe: true,
-            });
-            tokens += result.tokens;
-            text = redactPII(result.note.text || "");
-            page.text = text;
-            page.cachedNote = result;
+          let cached = await readCachedPage(cacheKey);
+          // Reuse completed conversions from workers predating durable page caches.
+          if (!cached && !existing && source.status === "ready") {
+            try {
+              const bytes = await readFile(storagePath(imageKey));
+              cached = {
+                text: await readFile(textFile, "utf8"),
+                imageKey,
+                width: bytes.readUInt32BE(16),
+                height: bytes.readUInt32BE(20),
+              };
+            } catch {
+              /* Incomplete files are regenerated. */
+            }
           }
-          await writeFile(textFile, text);
+          let page: ParsedPage;
+          if (cached) page = cached;
+          else if (
+            existing &&
+            (await access(storagePath(existing.imageKey)).then(
+              () => true,
+              () => false,
+            ))
+          ) {
+            page = {
+              text: existing.rawText,
+              imageKey: existing.imageKey,
+              width: existing.width,
+              height: existing.height,
+            };
+          } else {
+            await command("pdftoppm", [
+              "-f",
+              String(i),
+              "-l",
+              String(i),
+              "-singlefile",
+              "-scale-to",
+              "1400",
+              "-png",
+              pdf,
+              storagePath(imageKey).slice(0, -4),
+            ]);
+            await command("pdftotext", [
+              "-f",
+              String(i),
+              "-l",
+              String(i),
+              "-layout",
+              "-enc",
+              "UTF-8",
+              pdf,
+              textFile,
+            ]);
+            let text = redactPII(
+              (await readFile(textFile, "utf8")).replace(/\f/g, "").trim(),
+            );
+            const bytes = await readFile(storagePath(imageKey));
+            page = {
+              text,
+              imageKey,
+              width: bytes.readUInt32BE(16),
+              height: bytes.readUInt32BE(20),
+            };
+            if (!text && resolveProviderConfig("notes", true)) {
+              const result = await generatePageNote({
+                text,
+                language,
+                image: `data:image/png;base64,${bytes.toString("base64")}`,
+                transcribe: true,
+              });
+              tokens += result.tokens;
+              text = redactPII(result.note.text || "");
+              page.text = text;
+              page.cachedNote = result;
+            }
+            await writeFile(textFile, text);
+            await cachePage(cacheKey, page);
+          }
+          if (primaryIds.has(source.id) && !existing) {
+            db.insert(pages)
+              .values({
+                id: uid(),
+                courseId,
+                sourceId: source.id,
+                sourcePage: i,
+                index: offset + i,
+                imageKey: page.imageKey,
+                width: page.width,
+                height: page.height,
+                rawText: page.text,
+                title: pageTitle(page.text, language),
+              })
+              .run();
+          }
+          logPage(
+            jobId,
+            courseId,
+            source.id,
+            i,
+            cached || existing ? "extract_cached" : "extract",
+            started,
+            cached || existing ? undefined : page.cachedNote?.metrics,
+          );
           return page;
         },
         (completed) =>
@@ -254,13 +435,21 @@ export async function importJob(jobId: string) {
           ),
       );
       const textKey = `${folderKey}/text.txt`;
-      await writeFile(
-        storagePath(textKey),
-        sourcePages.map((p) => p.text).join("\n\f\n"),
-      );
+      if (
+        source.status !== "ready" ||
+        !(await access(storagePath(textKey)).then(
+          () => true,
+          () => false,
+        ))
+      ) {
+        await writeFile(
+          storagePath(textKey),
+          sourcePages.map((p) => p.text).join("\n\f\n"),
+        );
+      }
       db.update(sources)
         .set({ pdfKey, textKey, pages: count, status: "ready" })
-        .where(eq(sources.id, source.id))
+        .where(and(eq(sources.id, source.id), eq(sources.courseId, courseId)))
         .run();
       parsed.push({ source, pages: sourcePages });
     }
@@ -277,148 +466,217 @@ export async function importJob(jobId: string) {
       text: p.text.slice(0, 800),
     }));
     progress(33, "划分章节与知识点");
-    const result = await structured(
-      "structure",
-      StructureSchema,
-      `课程：${course.title}\n按页面内容划分章节和知识点，所有课内页码 1–${allPages.length} 均须归属知识点。返回 {"chapters":[{"title":"章节","summary":"概述","knowledgePoints":[{"title":"知识点","keywords":["词"],"pages":[1,2]}]}]}。教材可增加没有课件页的知识点。\n页面：${JSON.stringify(summaries).slice(0, 65000)}\n教材：${parsed
-        .filter((s) => s.source.kind === "textbook")
-        .flatMap((s) => s.pages.map((p) => p.text))
-        .join("\n")
-        .slice(0, 18000)}`,
-    );
-    tokens += result?.tokens || 0;
-    const tree = result?.data || {
-      chapters: [
-        {
-          title: course.title,
-          summary: "规则整理，待核对",
-          knowledgePoints: Array.from(
-            { length: Math.ceil(allPages.length / 4) },
-            (_, i) => ({
-              title: summaries[i * 4].title,
-              keywords: [summaries[i * 4].title],
-              pages: Array.from(
-                { length: Math.min(4, allPages.length - i * 4) },
-                (_, j) => i * 4 + j + 1,
-              ),
-            }),
-          ),
-        },
-      ],
-    };
+    const existingKps = db
+      .select()
+      .from(knowledgePoints)
+      .where(eq(knowledgePoints.courseId, courseId))
+      .orderBy(asc(knowledgePoints.order))
+      .all();
     const kps: (typeof knowledgePoints.$inferSelect & {
       pageNumbers: number[];
     })[] = [];
     const pageToKp = new Map<number, string>();
-    db.transaction((tx) => {
-      for (const [ci, chapter] of tree.chapters.entries()) {
-        const chapterId = uid();
-        tx.insert(chapters)
-          .values({
-            id: chapterId,
-            courseId,
-            order: ci,
-            title: redactPII(chapter.title),
-            summary: redactPII(chapter.summary || ""),
-          })
-          .run();
-        for (const kp of chapter.knowledgePoints) {
-          const pageNumbers = [
-            ...new Set(
-              kp.pages.filter(
-                (n) => n >= 1 && n <= allPages.length && !pageToKp.has(n),
-              ),
-            ),
-          ];
-          const row = {
-            id: uid(),
-            courseId,
-            chapterId,
-            code: `K${kps.length + 1}`,
-            order: kps.length,
-            title: redactPII(kp.title),
-            keywords: kp.keywords.map(redactPII),
-            contentMd: "",
-            hasSlides: pageNumbers.some(
-              (n) => allPages[n - 1].source.kind === "slides",
-            ),
-          };
-          tx.insert(knowledgePoints).values(row).run();
-          for (const n of pageNumbers) pageToKp.set(n, row.id);
-          kps.push({ ...row, pageNumbers });
-        }
+    if (existingKps.length) {
+      const savedPages = db
+        .select()
+        .from(pages)
+        .where(eq(pages.courseId, courseId))
+        .all();
+      for (const kp of existingKps) {
+        const pageNumbers = savedPages
+          .filter((p) => p.kpId === kp.id)
+          .map((p) => p.index);
+        kps.push({ ...kp, pageNumbers });
+        for (const n of pageNumbers) pageToKp.set(n, kp.id);
       }
-      // LLM 遗漏页也有确定归属，避免孤立页面。
+      // Compatibility with tasks interrupted between structure and page persistence.
       for (let n = 1; n <= allPages.length; n++)
         if (!pageToKp.has(n)) {
-          pageToKp.set(n, kps[0].id);
-          kps[0].pageNumbers.push(n);
+          const kp =
+            kps.find((k) => k.pageNumbers.some((page) => page >= n)) ||
+            kps.at(-1)!;
+          pageToKp.set(n, kp.id);
+          kp.pageNumbers.push(n);
         }
-      if (
-        allPages.some(
-          (p, i) =>
-            p.source.kind === "slides" && pageToKp.get(i + 1) === kps[0].id,
-        )
-      ) {
-        kps[0].hasSlides = true;
-        tx.update(knowledgePoints)
-          .set({ hasSlides: true })
-          .where(eq(knowledgePoints.id, kps[0].id))
-          .run();
-      }
-    });
-    progress(36, `整理逐页要点 0/${allPages.length}`);
-    const persistedPages = await mapImportPages(
-      allPages,
-      async (page, i) => {
+    } else {
+      const result = await optionalModel(
+        "structure",
+        structureSchema(allPages.length),
+        `课程：${course.title}\n${structurePrompt(allPages.length)}\n页面：${JSON.stringify(summaries).slice(0, 65000)}\n教材：${parsed
+          .filter((s) => s.source.kind === "textbook")
+          .flatMap((s) => s.pages.map((p) => p.text))
+          .join("\n")
+          .slice(0, 18000)}`,
+      );
+      tokens += result?.tokens || 0;
+      const { min, max } = knowledgePointRange(allPages.length);
+      const count = Math.min(
+        max,
+        Math.max(min, Math.ceil(allPages.length / 10)),
+      );
+      const tree = result?.data || {
+        chapters: [
+          {
+            title: course.title,
+            summary: "规则整理，待核对",
+            knowledgePoints: Array.from({ length: count }, (_, i) => {
+              const start = Math.floor((i * allPages.length) / count);
+              const end = Math.floor(((i + 1) * allPages.length) / count);
+              return {
+                title: fallbackKnowledgePointTitle(
+                  summaries.slice(start, end).map((p) => p.title),
+                  i,
+                ),
+                keywords: [],
+                pages: Array.from(
+                  { length: end - start },
+                  (_, j) => start + j + 1,
+                ),
+              };
+            }),
+          },
+        ],
+      };
+      db.transaction((tx) => {
+        for (const [ci, chapter] of tree.chapters.entries()) {
+          const chapterId = uid();
+          tx.insert(chapters)
+            .values({
+              id: chapterId,
+              courseId,
+              order: ci,
+              title: redactPII(chapter.title),
+              summary: redactPII(chapter.summary || ""),
+            })
+            .run();
+          for (const kp of chapter.knowledgePoints) {
+            const row = {
+              id: uid(),
+              courseId,
+              chapterId,
+              code: `K${kps.length + 1}`,
+              order: kps.length,
+              title: redactPII(kp.title),
+              keywords: kp.keywords.map(redactPII),
+              contentMd: "",
+              hasSlides: kp.pages.some(
+                (n) => allPages[n - 1].source.kind === "slides",
+              ),
+            };
+            tx.insert(knowledgePoints).values(row).run();
+            for (const n of kp.pages) pageToKp.set(n, row.id);
+            kps.push({ ...row, pageNumbers: kp.pages });
+          }
+        }
+        for (const [index, kpId] of pageToKp)
+          tx.update(pages)
+            .set({ kpId })
+            .where(and(eq(pages.courseId, courseId), eq(pages.index, index)))
+            .run();
+        markItem("structure", !!result, "章节与知识点使用规则划分，待核对");
+      });
+    }
+    const savedPages = db
+      .select()
+      .from(pages)
+      .where(eq(pages.courseId, courseId))
+      .all();
+    const savedNotes = new Set(
+      db
+        .select({ pageId: pageNotes.pageId })
+        .from(pageNotes)
+        .innerJoin(pages, eq(pageNotes.pageId, pages.id))
+        .where(eq(pages.courseId, courseId))
+        .all()
+        .map((n) => n.pageId),
+    );
+    let completedNotes = savedPages.filter((p) => savedNotes.has(p.id)).length;
+    const noteProgress = () =>
+      progress(
+        36 + Math.round((completedNotes / allPages.length) * 29),
+        `整理逐页要点 ${completedNotes}/${allPages.length}`,
+      );
+    noteProgress();
+    await mapImportPages(
+      allPages.filter(
+        (_, i) =>
+          !savedNotes.has(savedPages.find((p) => p.index === i + 1)!.id),
+      ),
+      async (page) => {
+        const started = performance.now();
+        const row = savedPages.find(
+          (p) =>
+            p.sourceId === page.source.id && p.sourcePage === page.sourcePage,
+        )!;
         let result = page.cachedNote;
         if (!result) {
           const image = resolveProviderConfig("notes", true)
             ? `data:image/png;base64,${(await readFile(storagePath(page.imageKey))).toString("base64")}`
             : undefined;
-          result = await generatePageNote({ text: page.text, language, image });
+          result = await generatePageNote({
+            text: page.text,
+            language,
+            image,
+            transcribe: !page.text && !!image,
+          });
           tokens += result.tokens;
         }
         const { note, model, ruleBased } = result;
-        const row = db
-          .insert(pages)
-          .values({
-            id: uid(),
-            courseId,
-            sourceId: page.source.id,
-            sourcePage: page.sourcePage,
-            index: i + 1,
-            imageKey: page.imageKey,
-            width: page.width,
-            height: page.height,
-            rawText: page.text,
-            title: redactPII(note.title),
-            kpId: pageToKp.get(i + 1)!,
-          })
-          .returning()
-          .get();
-        db.insert(pageNotes)
-          .values({
-            pageId: row.id,
-            title: row.title,
-            points: note.points.map(redactPII),
-            keys: note.keys.map(redactPII),
-            model,
-            qaStatus: qaNote(note, ruleBased),
-          })
-          .run();
-        return row;
+        const writeStart = performance.now();
+        db.transaction((tx) => {
+          tx.update(pages)
+            .set({
+              title: redactPII(note.title),
+              kpId: pageToKp.get(row.index)!,
+              rawText: page.text || redactPII(note.text || ""),
+            })
+            .where(and(eq(pages.id, row.id), eq(pages.courseId, courseId)))
+            .run();
+          tx.insert(pageNotes)
+            .values({
+              pageId: row.id,
+              title: redactPII(note.title),
+              points: note.points.map(redactPII),
+              keys: note.keys.map(redactPII),
+              model,
+              qaStatus: qaNote(note, ruleBased),
+            })
+            .run();
+        });
+        logPage(
+          jobId,
+          courseId,
+          page.source.id,
+          page.sourcePage,
+          page.cachedNote ? "notes_cached_ocr" : "notes",
+          started,
+          page.cachedNote ? undefined : result.metrics,
+          performance.now() - writeStart,
+        );
       },
-      (completed) =>
-        progress(
-          36 + Math.round((completed / allPages.length) * 29),
-          `整理逐页要点 ${completed}/${allPages.length}`,
-        ),
+      () => {
+        completedNotes++;
+        noteProgress();
+      },
     );
+    // Fill only missing legacy mappings; preserve teacher-reviewed assignments.
+    for (const row of savedPages)
+      if (!row.kpId)
+        db.update(pages)
+          .set({ kpId: pageToKp.get(row.index) })
+          .where(and(eq(pages.id, row.id), eq(pages.courseId, courseId)))
+          .run();
+    const persistedPages = db
+      .select()
+      .from(pages)
+      .where(eq(pages.courseId, courseId))
+      .orderBy(asc(pages.index))
+      .all();
     const textbookPages = parsed
       .filter((s) => s.source.kind === "textbook")
       .flatMap((s) => s.pages);
     for (const [i, kp] of kps.entries()) {
+      if (kp.contentMd.trim() || completedItem(`textbook:${kp.id}`)) continue;
       progress(
         67 + Math.round((i / kps.length) * 13),
         `整理知识点讲义 ${i + 1}/${kps.length}`,
@@ -438,35 +696,57 @@ export async function importJob(jobId: string) {
         .map((p) => p.text)
         .join("\n")
         .slice(0, 40000);
-      const content = await structured(
+      const content = await optionalModel(
         "textbook",
         TextbookSchema,
         `知识点 ${kp.code} ${kp.title}。依据下列教材/页面整理讲义，引用具体定义和例子；无资料时明确说明。返回 {"content_md":"Markdown 讲义"}。\n资料：\n${reference}`,
       );
       tokens += content?.tokens || 0;
-      db.update(knowledgePoints)
-        .set({
-          contentMd: redactPII(
-            content?.data.content_md ||
-              `## ${kp.title}\n\n> 规则整理，待核对。\n\n${reference || "请结合页图学习此知识点。"}`,
-          ),
-        })
-        .where(eq(knowledgePoints.id, kp.id))
-        .run();
+      db.transaction((tx) => {
+        tx.update(knowledgePoints)
+          .set({
+            contentMd: redactPII(
+              content?.data.content_md ||
+                `## ${kp.title}\n\n> 规则整理，待核对。\n\n${reference || "请结合页图学习此知识点。"}`,
+            ),
+          })
+          .where(
+            and(
+              eq(knowledgePoints.id, kp.id),
+              eq(knowledgePoints.courseId, courseId),
+            ),
+          )
+          .run();
+        markItem(
+          `textbook:${kp.id}`,
+          !!content,
+          `${kp.code} 讲义使用原文降级，待核对`,
+        );
+      });
     }
     const questionSources = parsed.filter(
       (s) => s.source.kind === "question_bank",
     );
-    let questionNumber = 0;
+    let questionNumber = db
+      .select()
+      .from(questions)
+      .where(eq(questions.courseId, courseId))
+      .all()
+      .reduce(
+        (max, q) => Math.max(max, Number(q.code.replace(/^Q-/, "")) || 0),
+        0,
+      );
     for (const [qi, source] of questionSources.entries()) {
       // 分批抽取，避免长题库静默截断。
       for (let start = 0; start < source.pages.length; start += 6) {
+        const itemKey = `questions:${source.source.id}:${start}`;
+        if (completedItem(itemKey)) continue;
         progress(
           81 + Math.round((qi / Math.max(1, questionSources.length)) * 13),
           `抽取习题：资料 ${qi + 1} · ${start + 1} 页起`,
         );
         const chunk = source.pages.slice(start, start + 6);
-        const extracted = await structured(
+        const extracted = await optionalModel(
           "questions",
           QuestionsSchema,
           `只抽取原文已有习题，不编题、不推导缺失答案。返回 {"questions":[{"type":"choice|truefalse|fill|short","prompt":"题干","options":[{"id":"A","text":"选项"}],"answer":null,"analysis":"原文解析","kpCode":"K1","pages":[1],"sourcePage":1,"confidence":"high|mid|low"}]}。options 仅选择题。answer 缺失必须 null；判断题答案用 T/F。pages 指课件页码；sourcePage 为原资料页码。知识点索引：${JSON.stringify(kps.map((k) => ({ code: k.code, title: k.title, pages: k.pageNumbers })))}\n原文：${JSON.stringify(chunk.map((p, i) => ({ page: start + i + 1, text: p.text.slice(0, 12000) })))}`,
@@ -475,61 +755,88 @@ export async function importJob(jobId: string) {
         const items =
           extracted?.data.questions ||
           fallbackQuestions(chunk.map((p) => p.text).join("\n"));
-        for (const q of items) {
-          const kp =
-            kps.find((k) => k.code === q.kpCode) ||
-            kps.find((k) =>
-              k.keywords.some((word) => q.prompt.includes(word)),
-            ) ||
-            kps[0];
-          let linked = persistedPages.filter(
-            (p) => p.kpId === kp.id && q.pages.includes(p.index),
-          );
-          if (!linked.length)
-            linked = persistedPages.filter((p) => p.kpId === kp.id).slice(0, 1);
-          let answer = q.answer?.trim() || null;
-          if (
-            q.type === "choice" &&
-            answer &&
-            !q.options?.some(
-              (o) => o.id.toUpperCase() === answer!.toUpperCase(),
+        db.transaction((tx) => {
+          for (const q of items) {
+            const kp =
+              kps.find((k) => k.code === q.kpCode) ||
+              kps.find((k) =>
+                k.keywords.some((word) => q.prompt.includes(word)),
+              ) ||
+              kps[0];
+            let linked = persistedPages.filter(
+              (p) => p.kpId === kp.id && q.pages.includes(p.index),
+            );
+            if (!linked.length)
+              linked = persistedPages
+                .filter((p) => p.kpId === kp.id)
+                .slice(0, 1);
+            let answer = q.answer?.trim() || null;
+            if (
+              q.type === "choice" &&
+              answer &&
+              !q.options?.some(
+                (o) => o.id.toUpperCase() === answer!.toUpperCase(),
+              )
             )
-          )
-            answer = null;
-          if (
-            q.type === "truefalse" &&
-            answer &&
-            !["T", "F"].includes(answer.toUpperCase())
-          )
-            answer = null;
-          db.insert(questions)
-            .values({
-              id: uid(),
-              courseId,
-              code: `Q-${String(++questionNumber).padStart(3, "0")}`,
-              type: q.type,
-              prompt: redactPII(q.prompt),
-              options: q.options?.map((o) => ({
-                ...o,
-                text: redactPII(o.text),
-              })),
-              answer: answer ? redactPII(answer) : null,
-              analysis: redactPII(q.analysis || ""),
-              kpId: kp.id,
-              pageIds: linked.map((p) => p.id),
-              source: {
-                sourceId: source.source.id,
-                page:
-                  q.sourcePage && q.sourcePage <= source.pages.length
-                    ? q.sourcePage
-                    : start + 1,
-              },
-              confidence: extracted ? q.confidence : "low",
-              verified: false,
-              reviewStatus: "needs_review",
-            })
-            .run();
-        }
+              answer = null;
+            if (
+              q.type === "truefalse" &&
+              answer &&
+              !["T", "F"].includes(answer.toUpperCase())
+            )
+              answer = null;
+            // Legacy jobs may have committed part of a batch before checkpoints existed.
+            const duplicate = tx
+              .select()
+              .from(questions)
+              .where(
+                and(
+                  eq(questions.courseId, courseId),
+                  eq(questions.prompt, redactPII(q.prompt)),
+                ),
+              )
+              .all()
+              .some(
+                (existing) =>
+                  existing.source !== "generated" &&
+                  existing.source.sourceId === source.source.id &&
+                  existing.source.page === (q.sourcePage || start + 1),
+              );
+            if (duplicate) continue;
+            tx.insert(questions)
+              .values({
+                id: uid(),
+                courseId,
+                code: `Q-${String(++questionNumber).padStart(3, "0")}`,
+                type: q.type,
+                prompt: redactPII(q.prompt),
+                options: q.options?.map((o) => ({
+                  ...o,
+                  text: redactPII(o.text),
+                })),
+                answer: answer ? redactPII(answer) : null,
+                analysis: redactPII(q.analysis || ""),
+                kpId: kp.id,
+                pageIds: linked.map((p) => p.id),
+                source: {
+                  sourceId: source.source.id,
+                  page:
+                    q.sourcePage && q.sourcePage <= source.pages.length
+                      ? q.sourcePage
+                      : start + 1,
+                },
+                confidence: extracted ? q.confidence : "low",
+                verified: false,
+                reviewStatus: "needs_review",
+              })
+              .run();
+          }
+          markItem(
+            itemKey,
+            !!extracted,
+            `习题资料 ${qi + 1} 第 ${start + 1}–${Math.min(start + 6, source.pages.length)} 页使用规则抽取，待核对`,
+          );
+        });
       }
     }
     progress(97, "检查课程完整性");
@@ -561,12 +868,16 @@ export async function importJob(jobId: string) {
     db.update(jobs)
       .set({
         status: "failed",
-        step: "导入失败，可重新导入",
+        step: `${db.select().from(jobs).where(eq(jobs.id, jobId)).get()?.step || "导入"}（失败，可继续）`,
         error: message,
         costTokens: tokens,
         finishedAt: now(),
       })
       .where(eq(jobs.id, jobId))
+      .run();
+    db.update(courses)
+      .set({ status: "failed" })
+      .where(eq(courses.id, courseId))
       .run();
     db.update(sources)
       .set({ status: "failed" })

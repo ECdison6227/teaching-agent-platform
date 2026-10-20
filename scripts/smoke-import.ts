@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, mkdtemp, readFile, writeFile, access } from "node:fs/promises";
@@ -43,6 +44,7 @@ async function main() {
     OPENAI_VISION_MODEL: "mock-vision",
     VISION_MODEL_PROVIDER: "openai-compatible",
     NEXT_TELEMETRY_DISABLED: "1",
+    MODEL_RETRY_BASE_MS: "1",
   };
   for (const task of ["CHAT", "STRUCTURE", "NOTES", "TEXTBOOK", "QUESTIONS"])
     Object.assign(env, {
@@ -54,7 +56,9 @@ async function main() {
     process.execPath,
     [
       "node_modules/next/dist/bin/next",
-      existsSync(".next/BUILD_ID") ? "start" : "dev",
+      existsSync(path.join(process.env.NEXT_DIST_DIR || ".next", "BUILD_ID"))
+        ? "start"
+        : "dev",
       "--hostname",
       "127.0.0.1",
       "--port",
@@ -397,7 +401,7 @@ async function main() {
     console.log(
       "PASS fallback import: DOCX -> PDF -> PNG/text, textbook-only, rules notes/questions, deduplication, cross-course isolation",
     );
-    // PPTX/PPT/DOC 走真实转换；单页失败降级，结构化任务失败仍可重跑。
+    // PPTX/PPT/DOC 走真实转换；页面失败降级、存储故障续跑与未就绪课程浏览。
     const fodp = `<?xml version="1.0" encoding="UTF-8"?><office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.presentation"><office:body><office:presentation><draw:page draw:name="One"><draw:frame svg:x="2cm" svg:y="2cm" svg:width="20cm" svg:height="10cm"><draw:text-box><text:p>Original probability lesson</text:p><text:p>List outcomes before computing a probability.</text:p></draw:text-box></draw:frame></draw:page><draw:page draw:name="Two"><draw:frame svg:x="2cm" svg:y="2cm" svg:width="20cm" svg:height="10cm"><draw:text-box><text:p>Independent events</text:p><text:p>One fair toss does not change the next.</text:p></draw:text-box></draw:frame></draw:page></office:presentation></office:body></office:document>`;
     await writeFile(path.join(office, "slides.fodp"), fodp);
     for (const ext of ["pptx", "ppt"])
@@ -434,36 +438,64 @@ async function main() {
     await upload(third.id, "slides", path.join(office, "slides.pptx"));
     await upload(third.id, "material", path.join(office, "slides.ppt"));
     await upload(third.id, "material", path.join(office, "original.doc"));
-    const degradedJob = await json<Job>(`/api/courses/${third.id}/jobs`, {
+    const failedJob = await json<Job>(`/api/courses/${third.id}/jobs`, {
       method: "POST",
     });
+    await page.goto(base + `/c/${third.slug}`);
+    await expect(
+      page.getByRole("progressbar", { name: "课程导入进度" }),
+    ).toBeVisible();
+    await expect(
+      page.getByText("尚无已生成页面，导入完成的页面将在这里显示。"),
+    ).toBeVisible();
+    // Fail a storage operation after notes have committed, without stopping any worker.
+    const smokeDb = new Database(path.join(runDir, "platform.sqlite"));
+    smokeDb.exec(`CREATE TRIGGER smoke_fail_lecture BEFORE UPDATE OF content_md ON knowledge_points
+      WHEN NEW.course_id = '${third.id}'
+      BEGIN SELECT RAISE(ABORT, 'smoke storage failure after notes'); END;`);
     await runWorker({ OPENAI_VISION_MODEL: "mock-error" });
-    await checkJob(degradedJob.id);
+    const failed = await json<Job>(`/api/jobs/${failedJob.id}`);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error || "", /smoke storage failure/);
     const degraded = await json<CourseContent>(`/api/courses/${third.id}`);
+    assert.equal(degraded.pages.length, 2);
     assert.ok(
       degraded.pages.every((p) => p.note?.model === "rules:model-failed"),
     );
     assert.ok(degraded.pages.every((p) => p.note?.qaStatus === "needs_review"));
-    const failedJob = await json<Job>(`/api/courses/${third.id}/jobs`, {
-      method: "POST",
-    });
-    await runWorker({ STRUCTURE_MODEL: "mock-error" });
-    const failed = await json<Job>(`/api/jobs/${failedJob.id}`);
-    assert.equal(failed.status, "failed");
-    assert.match(failed.error || "", /429/);
-    const retried = await json<Job>(`/api/courses/${third.id}/jobs`, {
-      method: "POST",
-    });
+    await page.reload();
+    await expect(
+      page.getByRole("alert").filter({ hasText: "smoke storage failure" }),
+    ).toContainText("smoke storage failure");
+    await expect(page.getByAltText(/^课程第 1 页/)).toBeVisible();
+    await expect(page.getByText("AI 学习要点", { exact: false })).toContainText(
+      "待核对",
+    );
+    await page.getByRole("button", { name: "下一页", exact: true }).click();
+    await expect(page.getByAltText(/^课程第 2 页/)).toBeVisible();
+    smokeDb.exec("DROP TRIGGER smoke_fail_lecture");
+    smokeDb.close();
+    const callsBeforeResume = mock.calls.length;
+    await page
+      .getByRole("button", { name: "从失败处继续", exact: true })
+      .click();
+    await expect(
+      page.getByRole("progressbar", { name: "课程导入进度" }),
+    ).toBeVisible();
+    await expect(page.getByAltText(/^课程第 2 页/)).toBeVisible();
+    const resuming = await json<CourseContent>(`/api/courses/${third.id}`);
     await runWorker({ MODEL_PROVIDER: "none" });
-    await checkJob(retried.id);
+    await checkJob(resuming.jobs[0].id);
     const officeCourse = await json<CourseContent>(`/api/courses/${third.id}`);
-    assert.equal(officeCourse.pages.length, 2);
+    assert.deepEqual(officeCourse.pages, degraded.pages);
+    assert.equal(mock.calls.length, callsBeforeResume);
     assert.ok(
       officeCourse.sources.every((s) => s.pdfKey && s.textKey && s.pages),
     );
     assert.ok(officeCourse.pages.every((p) => p.rawText.length > 10));
+    assert.deepEqual(pageErrors, []);
     console.log(
-      "PASS office/retry: PPTX + PPT + DOC -> PDF, page model failure degrades to rules, failed structure job recorded, reimport replaces partial data",
+      "PASS office/resume: PPTX + PPT + DOC -> PDF, failed page degrades, importing/failed course pages render existing images and notes, UI resumes without replacing completed data",
     );
     await writeFile(
       path.join(runDir, "result.json"),

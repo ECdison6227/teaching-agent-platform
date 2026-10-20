@@ -55,7 +55,7 @@ export async function startMockModel(port = 0) {
           ],
         };
       else if (task === "notes") {
-        const input = body.messages.at(-1).content;
+        const input = body.messages[1].content;
         const text = typeof input === "string" ? input : input[0].text;
         const title = text.match(/标题参考：([^\n]+)/)?.[1] || "概率学习";
         content = {

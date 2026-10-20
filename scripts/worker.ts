@@ -1,6 +1,7 @@
 import "./env";
 import { setTimeout } from "node:timers/promises";
 import { runOneJob } from "../src/lib/importer";
+import { importPageConcurrency } from "../src/lib/import-settings";
 let stopping = false;
 process.on("SIGINT", () => {
   stopping = true;
@@ -9,7 +10,7 @@ process.on("SIGTERM", () => {
   stopping = true;
 });
 console.log(
-  "Import worker ready (SQLite; concurrency=1). 使用 --once 处理一个任务后退出。",
+  `Import worker ready (SQLite; jobs=1, pages=${importPageConcurrency()}). 使用 --once 处理一个任务后退出。`,
 );
 async function main() {
   do {

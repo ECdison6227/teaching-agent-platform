@@ -117,6 +117,11 @@ export function ImportProgress({
           )}
         </CardContent>
         <CardFooter className="gap-3">
+          {job.status !== "done" && (
+            <Button asChild variant="outline">
+              <Link href={`/c/${course.slug}`}>浏览已生成内容</Link>
+            </Button>
+          )}
           {job.status === "done" && (
             <>
               <Button asChild>
@@ -128,7 +133,7 @@ export function ImportProgress({
             </>
           )}
           {job.status === "failed" && (
-            <Button onClick={() => void retry()}>重新导入</Button>
+            <Button onClick={() => void retry()}>从失败处继续</Button>
           )}
         </CardFooter>
       </Card>

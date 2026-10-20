@@ -15,6 +15,7 @@
     "db:init": "tsx scripts/init-db.ts",
     "db:generate": "drizzle-kit generate",
     "worker": "tsx scripts/worker.ts",
+    "import:resume": "tsx scripts/resume-import.ts",
     "samples": "node scripts/generate-samples.mjs",
     "smoke:import": "tsx scripts/smoke-import.ts",
     "mock:model": "node scripts/mock-model.mjs",

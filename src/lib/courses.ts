@@ -14,6 +14,7 @@ import {
   pageNotes,
   questions,
   jobs,
+  importItems,
 } from "../db/schema";
 import { courseDir, redactPII, storagePath } from "./storage";
 
@@ -128,6 +129,11 @@ export function courseContent(id: string) {
       .select()
       .from(questions)
       .where(eq(questions.courseId, id))
+      .all(),
+    importItems: db
+      .select()
+      .from(importItems)
+      .where(eq(importItems.courseId, id))
       .all(),
     jobs: db
       .select()
@@ -253,7 +259,7 @@ export function enqueueImport(courseId: string) {
       if (!input.some((s) => s.kind === "slides" || s.kind === "textbook"))
         throw new HttpError(400, "至少上传一份课程 PPT 或教材（也可用 PDF）");
       db.update(courses)
-        .set({ status: "draft" })
+        .set({ status: "importing" })
         .where(eq(courses.id, courseId))
         .run();
       return db

@@ -13,6 +13,7 @@ import {
   Send,
   Square,
 } from "lucide-react";
+import { CourseImportStatus } from "./CourseImportStatus";
 import type { CourseContent } from "@/lib/courses";
 import { useChat } from "@/lib/useChat";
 import { appPath } from "@/lib/app-path";
@@ -58,7 +59,9 @@ const views = [
   { id: "materials", label: "课程资料", icon: Library },
 ];
 export function CourseWorkspace({ data }: { data: CourseContent }) {
-  const [view, setView] = useState("chat"),
+  const [view, setView] = useState(
+      data.course.status === "ready" ? "chat" : "study",
+    ),
     [selectedKp, setSelectedKp] = useState("all"),
     [pageNumber, setPageNumber] = useState(1),
     [draft, setDraft] = useState("");
@@ -175,6 +178,7 @@ export function CourseWorkspace({ data }: { data: CourseContent }) {
             {data.course.title}
           </span>
         </header>
+        <CourseImportStatus data={data} />
         <div className="mx-auto w-full max-w-6xl flex-1 p-4 sm:p-8">
           {view === "chat" && (
             <div className="mx-auto max-w-3xl">
@@ -422,7 +426,9 @@ export function CourseWorkspace({ data }: { data: CourseContent }) {
                       </>
                     ) : (
                       <p className="p-6 text-muted-foreground">
-                        此知识点没有课件页，请阅读下方讲义。
+                        {data.pages.length
+                          ? "此知识点没有课件页，请阅读下方讲义。"
+                          : "尚无已生成页面，导入完成的页面将在这里显示。"}
                       </p>
                     )}
                   </CardContent>
@@ -436,14 +442,20 @@ export function CourseWorkspace({ data }: { data: CourseContent }) {
                         : "待核对"}
                     </CardDescription>
                     <CardTitle className="leading-7">
-                      {shownPages.length ? page?.note?.title : kp?.title}
+                      {shownPages.length
+                        ? page?.note?.title || page?.title
+                        : kp?.title}
                     </CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-4">
                     {shownPages.length ? (
-                      page?.note?.points.map((p, i) => (
-                        <Markdown key={i} text={`${i + 1}. ${p}`} />
-                      ))
+                      page?.note ? (
+                        page.note.points.map((p, i) => (
+                          <Markdown key={i} text={`${i + 1}. ${p}`} />
+                        ))
+                      ) : (
+                        <p>要点正在整理，可先浏览页图。</p>
+                      )
                     ) : (
                       <p>请结合知识点讲义学习。</p>
                     )}
@@ -467,7 +479,16 @@ export function CourseWorkspace({ data }: { data: CourseContent }) {
               {kp && (
                 <Card className="shadow-none">
                   <CardHeader>
-                    <CardDescription>{kp.code} · 知识点讲义</CardDescription>
+                    <CardDescription>
+                      {kp.code} · 知识点讲义
+                      {data.importItems.some(
+                        (item) =>
+                          item.key === `textbook:${kp.id}` &&
+                          item.status === "needs_review",
+                      )
+                        ? " · 待核对"
+                        : ""}
+                    </CardDescription>
                     <CardTitle>{kp.title}</CardTitle>
                   </CardHeader>
                   <CardContent>

@@ -18,7 +18,7 @@ export const courses = sqliteTable("courses", {
   visibility: text("visibility", { enum: ["private", "class", "public"] })
     .notNull()
     .default("private"),
-  status: text("status", { enum: ["draft", "ready"] })
+  status: text("status", { enum: ["draft", "importing", "failed", "ready"] })
     .notNull()
     .default("draft"),
   persona: text("persona"),
@@ -178,3 +178,17 @@ export type Page = typeof pages.$inferSelect;
 export type KnowledgePoint = typeof knowledgePoints.$inferSelect;
 export type Question = typeof questions.$inferSelect;
 export type Job = typeof jobs.$inferSelect;
+
+/** Per-course durable completion markers; empty/fallback batches are also recorded. */
+export const importItems = sqliteTable(
+  "import_items",
+  {
+    courseId: text("course_id")
+      .notNull()
+      .references(() => courses.id, { onDelete: "cascade" }),
+    key: text("key").notNull(),
+    status: text("status", { enum: ["done", "needs_review"] }).notNull(),
+    message: text("message"),
+  },
+  (t) => [uniqueIndex("import_item_course_key").on(t.courseId, t.key)],
+);

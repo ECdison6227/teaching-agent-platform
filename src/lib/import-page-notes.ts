@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { PageNoteSchema } from "./import-schemas";
-import { structured } from "./models/provider";
+import { structured, modelMetrics, type ModelMetrics } from "./models/provider";
 
 export function normalizePageTitle(title: string) {
   return title.trim().replace(/[\s:：;；,，。.!！?？、…]+$/u, "");
@@ -30,6 +30,7 @@ export type PageNoteResult = {
   model: string;
   tokens: number;
   ruleBased: boolean;
+  metrics: ModelMetrics;
 };
 
 export async function generatePageNote({
@@ -60,13 +61,19 @@ export async function generatePageNote({
       });
   });
   let model = "rules:no-model";
+  let metrics = modelMetrics();
   try {
     const result = await structured(
       "notes",
       schema,
       notePrompt(text, title, language),
       image,
-      { retries: 2 },
+      {
+        retries: 2,
+        onMetrics: (value) => {
+          metrics = value;
+        },
+      },
     );
     if (result)
       return {
@@ -74,6 +81,7 @@ export async function generatePageNote({
         model: result.model,
         tokens: result.tokens,
         ruleBased: false,
+        metrics,
       };
   } catch {
     model = "rules:model-failed";
@@ -98,5 +106,6 @@ export async function generatePageNote({
     model,
     tokens: 0,
     ruleBased: true,
+    metrics,
   };
 }
