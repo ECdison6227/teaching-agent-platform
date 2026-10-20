@@ -27,8 +27,19 @@ export async function startMockModel(port = 0) {
             m.content.some((p) => p.type === "image_url"),
         ),
       });
+      const user = body.messages[1]?.content;
+      const inputText = typeof user === "string" ? user : user?.[0]?.text || "";
       let content;
-      if (task === "structure")
+      if (task === "questions" && inputText.includes("步骤：公式视觉回填")) {
+        content = {
+          text: inputText
+            .split("完整原文：\n")[1]
+            .replace("____", "$x>0$")
+            .replace(/A\.\s*\n/, "A. $x$\n"),
+          confidence: 0.94,
+          complete: true,
+        };
+      } else if (task === "structure")
         content = {
           chapters: [
             {
@@ -129,6 +140,15 @@ export async function startMockModel(port = 0) {
             },
           ],
         };
+        if (originals.some((q) => q.text.includes("matching expression")))
+          content.questions = originals.map((q) => ({
+            type: "choice",
+            prompt: q.text,
+            options: q.preprocessed?.options,
+            answer: null,
+            sourceQuestionId: q.id,
+            pages: [],
+          }));
         content.questions = content.questions.map((q, i) => ({
           ...q,
           sourceQuestionId: originals[i]?.id,

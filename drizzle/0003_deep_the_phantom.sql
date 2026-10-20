@@ -1,0 +1,1 @@
+ALTER TABLE `questions` ADD `formula_recovery` text;

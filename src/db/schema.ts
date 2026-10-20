@@ -6,6 +6,7 @@ import {
   text,
   uniqueIndex,
 } from "drizzle-orm/sqlite-core";
+import type { FormulaRecovery } from "../lib/formulas";
 
 export const courses = sqliteTable("courses", {
   id: text("id").primaryKey(),
@@ -133,6 +134,9 @@ export const questions = sqliteTable(
     >(),
     answer: text("answer"),
     analysis: text("analysis"),
+    formulaRecovery: text("formula_recovery", {
+      mode: "json",
+    }).$type<FormulaRecovery>(),
     kpId: text("kp_id").references(() => knowledgePoints.id, {
       onDelete: "set null",
     }),
@@ -142,7 +146,15 @@ export const questions = sqliteTable(
     }),
     pageIds: text("page_ids", { mode: "json" }).$type<string[]>().notNull(),
     source: text("source", { mode: "json" })
-      .$type<{ sourceId: string; page?: number } | "generated">()
+      .$type<
+        | {
+            sourceId: string;
+            page?: number;
+            questionId?: string;
+            endPage?: number;
+          }
+        | "generated"
+      >()
       .notNull(),
     confidence: text("confidence", { enum: ["high", "mid", "low"] }).notNull(),
     verified: integer("verified", { mode: "boolean" }).notNull().default(false),

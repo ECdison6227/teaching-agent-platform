@@ -11,6 +11,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { chromium, expect } from "@playwright/test";
 import { startMockModel } from "./mock-model.mjs";
 import { generateSamples } from "./generate-samples.mjs";
+import { generateFormulaSamples } from "./generate-formula-sample.mjs";
 import type { CourseContent } from "../src/lib/courses";
 import type { Job } from "../src/db/schema";
 
@@ -498,6 +499,75 @@ async function main() {
     assert.deepEqual(pageErrors, []);
     console.log(
       "PASS office/resume: PPTX + PPT + DOC -> PDF, failed page degrades, importing/failed course pages render existing images and notes, UI resumes without replacing completed data",
+    );
+    const formulaDir = path.join(runDir, "formulas");
+    await generateFormulaSamples(formulaDir);
+    const formulaCourse = await json<{ id: string; slug: string }>(
+      "/api/courses",
+      post({ title: "原创公式恢复验证" }),
+    );
+    await upload(
+      formulaCourse.id,
+      "textbook",
+      path.join(formulaDir, "omml-textbook.docx"),
+    );
+    await upload(
+      formulaCourse.id,
+      "question_bank",
+      path.join(formulaDir, "omml-questions.docx"),
+    );
+    await upload(
+      formulaCourse.id,
+      "question_bank",
+      path.join(formulaDir, "missing-formulas.docx"),
+    );
+    const formulaJob = await json<Job>(
+      `/api/courses/${formulaCourse.id}/jobs`,
+      { method: "POST" },
+    );
+    await runWorker({ MODEL_PROVIDER: "none" });
+    await checkJob(formulaJob.id);
+    const formulasBefore = await json<CourseContent>(
+      `/api/courses/${formulaCourse.id}`,
+    );
+    assert.equal(formulasBefore.questions.length, 2);
+    assert.ok(
+      formulasBefore.questions.some((q) =>
+        q.formulaRecovery?.evidence.some((e) => e.source === "omml"),
+      ),
+    );
+    const missing = formulasBefore.questions.find(
+      (q) => q.formulaRecovery?.status === "missing",
+    )!;
+    assert.ok(missing);
+    await page.goto(base + `/teach/${formulaCourse.id}/review`);
+    await expect(page.getByText(/公式缺失，需核对原文/)).toBeVisible();
+    await exec(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "scripts/resume-import.ts",
+        formulaCourse.id,
+        "--from",
+        "formulas",
+      ],
+      { env },
+    );
+    const formulasAfter = await json<CourseContent>(
+      `/api/courses/${formulaCourse.id}`,
+    );
+    const fixed = formulasAfter.questions.find((q) => q.id === missing.id)!;
+    assert.equal(fixed.formulaRecovery?.status, "recovered");
+    assert.equal(fixed.formulaRecovery.evidence[0].source, "vision");
+    assert.equal(fixed.options?.[0].text, "$x$");
+    assert.equal(fixed.verified, false);
+    assert.deepEqual(formulasAfter.pages, formulasBefore.pages);
+    await page.reload();
+    await expect(page.getByText(/vision · 置信度 94%/)).toBeVisible();
+    assert.deepEqual(pageErrors, []);
+    console.log(
+      "PASS formulas: original OMML DOCX -> PDF/page images -> LaTeX in textbook, question and options; review flags missing formulas; mock vision + CLI formula-only recovery preserves pages",
     );
     await writeFile(
       path.join(runDir, "result.json"),

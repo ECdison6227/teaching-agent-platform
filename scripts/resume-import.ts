@@ -15,12 +15,12 @@ async function main() {
   const from =
     args.length === 2 &&
     args[0] === "--from" &&
-    ["questions", "answers"].includes(args[1])
-      ? (args[1] as "questions" | "answers")
+    ["questions", "answers", "formulas"].includes(args[1])
+      ? (args[1] as "questions" | "answers" | "formulas")
       : undefined;
   if (!courseId || (args.length && !from))
     throw new Error(
-      "用法：npm run import:resume -- <courseId> [--from questions|answers]",
+      "用法：npm run import:resume -- <courseId> [--from questions|answers|formulas]",
     );
   const course = getCourse(courseId);
   if (!from && course.status === "ready") {

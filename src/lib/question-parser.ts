@@ -4,6 +4,7 @@ export type QuestionOption = { id: string; text: string };
 export type QuestionBoundary = {
   id: string;
   page: number;
+  endPage?: number;
   text: string;
   typeHint?: QuestionType;
   numbered: boolean;
@@ -125,8 +126,10 @@ export function questionBoundaries(
           typeHint: hint,
           numbered: true,
         };
-      } else if (current) current.text += `\n${line}`;
-      else if (line.trim()) {
+      } else if (current) {
+        current.text += `\n${line}`;
+        if (line.trim()) current.endPage = pageIndex + 1;
+      } else if (line.trim()) {
         loose ||= {
           id: "",
           page: pageIndex + 1,

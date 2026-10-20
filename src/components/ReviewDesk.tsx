@@ -6,6 +6,7 @@ import { appPath } from "@/lib/app-path";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Textarea } from "./ui/textarea";
+import { Markdown } from "./Markdown";
 import {
   Card,
   CardHeader,
@@ -126,6 +127,18 @@ export function ReviewDesk({ initial }: { initial: CourseContent }) {
         ))}
       </section>
       <section className="space-y-4">
+        {data.importItems
+          .filter(
+            (item) =>
+              item.key.startsWith("formulas:") &&
+              item.key.includes(":page:") &&
+              item.status === "needs_review",
+          )
+          .map((item) => (
+            <p key={item.key} role="alert" className="text-sm text-destructive">
+              教材公式缺失 · {item.message}；请核对原始页图后重跑公式恢复。
+            </p>
+          ))}
         <h2 className="text-xl font-semibold">页面要点与归属</h2>
         {data.pages.map((page, i) => (
           <Card key={page.id}>
@@ -229,14 +242,32 @@ export function ReviewDesk({ initial }: { initial: CourseContent }) {
                 {!q.kpId && " · 未关联"}
                 {q.answerMethod === "consensus" && " · 两轮推导一致"}
                 {q.answerMethod === "arbitrated" && " · 仲裁待核对"}
+                {q.formulaRecovery?.status === "missing" && " · 公式缺失"}
               </CardTitle>
-              <CardDescription className="whitespace-pre-wrap">
-                {q.prompt}
-              </CardDescription>
-              {q.options?.map((o) => (
-                <p key={o.id} className="text-sm">
-                  {o.id}. {o.text}
+              {q.formulaRecovery && (
+                <p className="text-sm text-muted-foreground">
+                  {q.formulaRecovery.status === "missing"
+                    ? "公式缺失，需核对原文。"
+                    : "公式已恢复，待核对。"}
+                  {q.formulaRecovery.evidence.map((item, i) => (
+                    <span key={i}>
+                      {" "}
+                      {item.source} · 置信度 {Math.round(item.confidence * 100)}
+                      %
+                    </span>
+                  ))}
                 </p>
+              )}
+              <Markdown
+                text={q.prompt}
+                className="text-sm text-muted-foreground"
+              />
+              {q.options?.map((o) => (
+                <Markdown
+                  key={o.id}
+                  text={`${o.id}. ${o.text}`}
+                  className="text-sm"
+                />
               ))}
             </CardHeader>
             <CardContent className="space-y-3">
@@ -269,7 +300,7 @@ export function ReviewDesk({ initial }: { initial: CourseContent }) {
               <div className="flex gap-2">
                 <Button
                   size="sm"
-                  disabled={busy}
+                  disabled={busy || q.formulaRecovery?.status === "missing"}
                   onClick={() =>
                     void save({
                       kind: "question",

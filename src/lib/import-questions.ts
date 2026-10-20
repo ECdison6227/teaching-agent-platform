@@ -10,6 +10,7 @@ import {
 } from "../db/schema";
 import { uid } from "./courses";
 import { redactPII } from "./storage";
+import { formulaGapReasons, type FormulaRecovery } from "./formulas";
 import { structured } from "./models/provider";
 import { QuestionsSchema, QuestionAnswerSchema } from "./import-schemas";
 import {
@@ -25,7 +26,12 @@ import {
   type QuestionBoundary,
 } from "./question-parser";
 
-type QuestionSource = { sourceId: string; pages: { text: string }[] };
+type QuestionSource = {
+  sourceId: string;
+  pages: { text: string }[];
+  boundaries?: QuestionBoundary[];
+  formulas?: Record<string, FormulaRecovery>;
+};
 type Context = ReturnType<typeof questionContext>;
 type Hooks = {
   progress: (value: number, step: string) => void;
@@ -262,7 +268,12 @@ export async function runQuestionAnswers(courseId: string, hooks: Hooks) {
     .from(questions)
     .where(eq(questions.courseId, courseId))
     .all()
-    .filter((q) => !q.answer?.trim() && !q.verified);
+    .filter(
+      (q) =>
+        !q.answer?.trim() &&
+        !q.verified &&
+        q.formulaRecovery?.status !== "missing",
+    );
   await mapImportPages(
     pending,
     async (question) => {
@@ -322,7 +333,7 @@ export async function runQuestionExtraction(
   const context = questionContext(courseId);
   const size = importQuestionBatch();
   const batches = sources.flatMap((source) => {
-    const boundaries = questionBoundaries(source.pages);
+    const boundaries = source.boundaries || questionBoundaries(source.pages);
     const result = [];
     // Empty documents still get a durable completion marker.
     for (let start = 0; start < Math.max(1, boundaries.length); start += size)
@@ -352,7 +363,7 @@ export async function runQuestionExtraction(
     );
   await mapImportPages(
     batches,
-    async ({ sourceId, pages: sourcePages, batch, key }) => {
+    async ({ sourceId, pages: sourcePages, formulas, batch, key }) => {
       if (completed.has(key)) return;
       const result = batch.length
         ? await extractBatch(batch, courseId, context)
@@ -367,8 +378,13 @@ export async function runQuestionExtraction(
             batch.find((q) => q.id === item.sourceQuestionId) ||
             (items.length === batch.length ? batch[index] : undefined);
           const rules = boundary?.numbered ? ruleQuestion(boundary) : undefined;
+          const recovery = boundary && formulas?.[boundary.id];
           const q = normalizeQuestion(
-            { ...item, options: rules?.options || item.options },
+            {
+              ...item,
+              ...(recovery && rules ? { prompt: rules.prompt } : {}),
+              options: rules?.options || item.options,
+            },
             boundary?.typeHint,
           );
           const kp =
@@ -421,11 +437,25 @@ export async function runQuestionExtraction(
               })),
               answer: answer ? redactPII(answer) : null,
               analysis: redactPII(item.analysis || ""),
+              formulaRecovery:
+                recovery ||
+                (formulaGapReasons(q.prompt, q.options).length
+                  ? {
+                      status: "missing",
+                      evidence: [],
+                      reasons: formulaGapReasons(q.prompt, q.options),
+                    }
+                  : null),
               answerMethod: answer ? "source" : null,
               kpId: kp?.id || null,
               kpConfidence: kp ? item.kpConfidence : 0,
               pageIds,
-              source: { sourceId, page: sourcePage },
+              source: {
+                sourceId,
+                page: sourcePage,
+                questionId: boundary?.id,
+                endPage: boundary?.endPage,
+              },
               confidence: result ? item.confidence : "low",
               verified: false,
               reviewStatus: "needs_review",

@@ -33,6 +33,7 @@ import {
 import { PageNoteSchema, TextbookSchema } from "./import-schemas";
 import { z } from "zod";
 import { runQuestionExtraction, runQuestionAnswers } from "./import-questions";
+import { runFormulaStep } from "./import-formulas";
 import { questionBoundaries, ruleQuestion } from "./question-parser";
 import { command } from "./import-command";
 import { mapImportPages, importPageConcurrency } from "./import-settings";
@@ -218,13 +219,21 @@ export async function importJob(jobId: string) {
       .from(courses)
       .where(eq(courses.id, courseId))
       .get()!;
-    if (job.type === "import:questions" || job.type === "import:answers") {
+    if (
+      ["import:questions", "import:answers", "import:formulas"].includes(
+        job.type,
+      )
+    ) {
       const hooks = {
         progress,
         tokens: (amount: number) => {
           tokens += amount;
         },
       };
+      const recovered =
+        job.type !== "import:answers"
+          ? await runFormulaStep(courseId, hooks, true)
+          : [];
       if (job.type === "import:questions") {
         const questionSources = db
           .select()
@@ -244,11 +253,13 @@ export async function importJob(jobId: string) {
           texts.push({
             sourceId: source.id,
             pages: text.split(/\f/).map((text) => ({ text })),
+            ...recovered.find((s) => s.sourceId === source.id),
           });
         }
         await runQuestionExtraction(courseId, texts, hooks);
       }
-      await runQuestionAnswers(courseId, hooks);
+      if (job.type !== "import:formulas")
+        await runQuestionAnswers(courseId, hooks);
       db.transaction((tx) => {
         tx.update(courses)
           .set({ status: "ready" })
@@ -258,7 +269,8 @@ export async function importJob(jobId: string) {
           .set({
             status: "done",
             progress: 100,
-            step: "习题步骤完成",
+            step:
+              job.type === "import:formulas" ? "公式步骤完成" : "习题步骤完成",
             costTokens: tokens,
             finishedAt: now(),
             heartbeatAt: now(),
@@ -502,6 +514,23 @@ export async function importJob(jobId: string) {
         .run();
       parsed.push({ source, pages: sourcePages });
     }
+    const questionHooks = {
+      progress,
+      tokens: (amount: number) => {
+        tokens += amount;
+      },
+    };
+    const formulaSources = await runFormulaStep(courseId, questionHooks);
+    for (const entry of parsed) {
+      const recovered = formulaSources.find(
+        (s) => s.sourceId === entry.source.id,
+      );
+      if (recovered && entry.source.kind === "textbook")
+        entry.pages = entry.pages.map((p, i) => ({
+          ...p,
+          text: recovered.pages[i].text,
+        }));
+    }
     const primary = parsed.filter((s) => s.source.kind === "slides");
     if (!primary.length)
       primary.push(...parsed.filter((s) => s.source.kind === "textbook"));
@@ -688,7 +717,11 @@ export async function importJob(jobId: string) {
               points: note.points.map(redactPII),
               keys: note.keys.map(redactPII),
               model,
-              qaStatus: qaNote(note, ruleBased),
+              qaStatus:
+                formulaSources.find((s) => s.sourceId === page.source.id)
+                  ?.formulas[String(page.sourcePage)]?.status === "missing"
+                  ? "needs_review"
+                  : qaNote(note, ruleBased),
             })
             .run();
         });
@@ -773,17 +806,15 @@ export async function importJob(jobId: string) {
         );
       });
     }
-    const questionHooks = {
-      progress,
-      tokens: (amount: number) => {
-        tokens += amount;
-      },
-    };
     await runQuestionExtraction(
       courseId,
       parsed
         .filter((s) => s.source.kind === "question_bank")
-        .map((s) => ({ sourceId: s.source.id, pages: s.pages })),
+        .map((s) => ({
+          sourceId: s.source.id,
+          pages: s.pages,
+          ...formulaSources.find((r) => r.sourceId === s.source.id),
+        })),
       questionHooks,
     );
     await runQuestionAnswers(courseId, questionHooks);

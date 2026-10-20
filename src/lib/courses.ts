@@ -286,7 +286,7 @@ export function enqueueImport(courseId: string) {
  * A live worker never sees an unclaimed reset job; no process is stopped. */
 export function restartQuestionSteps(
   courseId: string,
-  from: "questions" | "answers",
+  from: "questions" | "answers" | "formulas",
 ) {
   const { db, sqlite } = database();
   return sqlite
@@ -326,6 +326,7 @@ export function restartQuestionSteps(
               or(
                 like(importItems.key, "questions:%"),
                 like(importItems.key, "answers:%"),
+                like(importItems.key, "formulas:%"),
               ),
             ),
           )
@@ -345,7 +346,12 @@ export function restartQuestionSteps(
           createdAt: now(),
           startedAt: now(),
           heartbeatAt: now(),
-          step: from === "questions" ? "重抽习题" : "续跑答案推导",
+          step:
+            from === "questions"
+              ? "重抽习题"
+              : from === "formulas"
+                ? "重跑公式恢复"
+                : "续跑答案推导",
           progress: 1,
         })
         .returning()

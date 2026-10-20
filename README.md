@@ -25,7 +25,7 @@ Ubuntu / Debian 系统依赖：
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y libreoffice poppler-utils
+sudo apt-get install -y libreoffice poppler-utils unzip
 ```
 
 macOS（Homebrew）：
@@ -71,13 +71,23 @@ npm run worker
 
 ```bash
 npm run import:resume -- <courseId>
-# 清除该课程旧的自动抽取习题，重新抽取并推导答案
+# 清除该课程旧的自动抽取习题，恢复公式、重新抽取并推导答案
 npm run import:resume -- <courseId> --from questions
+# 只重跑 DOC/DOCX 教材与题库的公式恢复，保留题目 ID 和已审核题目
+npm run import:resume -- <courseId> --from formulas
 # 仅续跑缺答案的题目，已有答案与已核对题目跳过
 npm run import:resume -- <courseId> --from answers
 ```
 
-`--from questions` 只读取已有习题原文缓存，不修改页图、页要点、知识点、讲义或原资料；清理范围包括已核对的旧自动题，保留手动生成题。该命令原子清理并直接领取定向任务，存在活跃任务时退出且不删除内容；失败后用不带 `--from` 的命令或界面续跑，保留已完成批次，不再重新清理。`--from answers` 可对已就绪课程补推缺失答案，不重抽题目。答案步骤逐题保存结果，缺答案可再次续跑；没有配置模型时保留缺失并待人工补充。
+`--from questions` 读取已有习题原文缓存，自动先重跑 DOC/DOCX 公式恢复；清理范围包括已核对的旧自动题，保留手动生成题。该命令原子清理并直接领取定向任务，存在活跃任务时退出且不删除内容；失败后用不带 `--from` 的命令或界面续跑，保留已完成批次，不再重新清理。`--from formulas` 只修复该课程教材原文、未审核题目的题干与选项，保留题目 ID、已审核题目、知识点、讲义和现有页图；不重新推导答案，题面变化时清空旧的推导答案，原文答案保留。教材有未能恢复的公式时，页面要点标记待核对。`--from answers` 可对已就绪课程补推缺失答案，不重抽题目；公式仍缺失的题目跳过推导。答案步骤逐题保存结果，缺答案可再次续跑；没有配置模型时保留缺失并待人工补充。
+
+DOC/DOCX 教材和题库复用 LibreOffice → PDF → pdftoppm 页图管线，同时直接读取 DOCX 的 OMML（旧 DOC 先尝试转换为 DOCX），将可解析的分式、上下标、根式、矩阵等转为 LaTeX。连续空白、条件中的下划线占位、空选项、数学上下文中的空括号及未解析的 OLE/MathType 对象会触发视觉回填；普通尾部答题括号与填空槽保留。视觉使用 `VISION_MODEL_PROVIDER` 和通道的 `*_VISION_MODEL`，不使用纯文本模型猜公式；只接受置信度至少 0.75、LaTeX 有效且保留原文及选项 ID 的结果。题目 `formulaRecovery` 记录 `omml` / `vision` 来源、置信度及公式，未能可靠恢复时保留 `needs_review`，审核台显示“公式缺失”并阻止确认答案。恢复缓存和文件仅存放在 DATA_DIR；普通续跑复用缓存，显式 `--from formulas` / `--from questions` 会重新尝试。复杂对象和无法定位的公式仍需核对原始页图。
+
+生成原创、通用学科的 OMML 与视觉回填样例（输出到 DATA_DIR，不提交生成文件）：
+
+```bash
+node scripts/generate-formula-sample.mjs
+```
 
 CLI 新建或复用该课程的任务，只领取指定课程；已有活跃 worker 时输出任务 ID 后退出，已就绪课程直接退出。进程中断的任务需等心跳过期后才能被续跑。新版本通过数据库 `import_items` 记录结构、讲义和习题批次的完成状态；转换/OCR 结果原子缓存到 DATA_DIR 内的逐页 JSON，兼容旧版本已入库的页面、要点和非空讲义。模型无法解析的单项使用规则/原文降级并标为待核对，仍视为该项已处理，续跑不会重复请求。
 
@@ -171,7 +181,7 @@ npm run smoke:import
 
 Smoke 使用本地 HTTP mock 模型，自动启动隔离的 Next 服务和 worker，将独立临时目录（系统临时目录下 `tap-smoke-*`，结束时输出位置）设为自己的 `DATA_DIR`，保存原创样例、数据库、结果和浏览器截图，不使用真实模型凭据或现有数据目录。已有生产构建时使用生产模式，否则使用开发模式；结束时通过 IPC 让自己创建的服务关闭 HTTP/Next 并自行退出，不向进程发送终止信号。已有服务运行时，可令构建和 smoke 使用同一个独立目录，例如 `NEXT_DIST_DIR=.next-check npm run build`、`NEXT_DIST_DIR=.next-check npm run smoke:import`，避免覆盖现有服务的 `.next`。
 
-Smoke 会实际点击五步建课向导，用原创四页概率 PDF、同一教材 PDF 和一页习题 PDF 完整导入，检查页图、文本、知识点、要点、讲义、四种题型入库、课程渲染、SSE 对话、翻页、移动侧栏、审核以及笔记保存与隔离；再验证无模型教材 DOCX 导入，PPTX / PPT / DOC 转换、单页模型失败降级、未就绪课程页面渲染，以及写入中断后通过 UI 续跑且保留已完成内容。单元/集成测试另覆盖各模型步骤的 LaTeX JSON、网络/超时重试、能力降级、连续页段校验、空题目批次检查点、选项/题型规则、题目批并发与降级、未关联、独立推导一致/仲裁、SQLite 旧题迁移和真实 CLI 定向续跑。
+Smoke 会实际点击五步建课向导，用原创四页概率 PDF、同一教材 PDF 和一页习题 PDF 完整导入，检查页图、文本、知识点、要点、讲义、四种题型入库、课程渲染、SSE 对话、翻页、移动侧栏、审核以及笔记保存与隔离；再验证无模型教材 DOCX 导入，PPTX / PPT / DOC 转换、单页模型失败降级、未就绪课程页面渲染，以及写入中断后通过 UI 续跑且保留已完成内容。原创 OMML DOCX 样例验证教材、题干和选项的公式恢复，浏览器验证“公式缺失”提示，再通过 mock 视觉模型及真实 `--from formulas` CLI 回填并保留页图。单元/集成测试另覆盖各模型步骤的 LaTeX JSON、网络/超时重试、能力降级、连续页段校验、空题目批次检查点、选项/题型规则、题目批并发与降级、未关联、独立推导一致/仲裁、SQLite 旧题迁移和真实 CLI 定向续跑。
 
 浏览器验收使用 Playwright。已有 Google Chrome 时自动使用 `/opt/google/chrome/chrome`，也可指定 `CHROME_BIN`；其他环境先运行：
 

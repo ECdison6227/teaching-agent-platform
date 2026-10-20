@@ -149,6 +149,8 @@ export function reviewContent(courseId: string, body: unknown) {
           )
           .get();
         if (!q) throw new HttpError(404, "题目不存在");
+        if (input.verified && q.formulaRecovery?.status === "missing")
+          throw new HttpError(400, "公式缺失，请先重跑公式恢复并核对原文");
         const answer = input.answer?.trim() || null;
         if (input.verified && !answer)
           throw new HttpError(400, "补全答案后才能确认核对");
