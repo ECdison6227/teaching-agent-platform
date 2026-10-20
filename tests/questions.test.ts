@@ -24,6 +24,7 @@ import {
   sources,
   courses,
   jobs,
+  importItems,
 } from "../src/db/schema";
 import {
   createCourse,
@@ -51,6 +52,7 @@ import {
 import { claimJob, importJob } from "../src/lib/importer";
 import { makePdf } from "../scripts/generate-samples.mjs";
 import { storagePath } from "../src/lib/storage";
+import { importNotices } from "../src/lib/import-notices";
 
 const dir = await mkdtemp(path.join(tmpdir(), "tap-questions-test-"));
 process.env.DATA_DIR = dir;
@@ -323,7 +325,7 @@ test("按题分批并发、失败批重试后独立降级、进度按批与持�
   ];
   await runQuestionExtraction(f.course.id, source, h.callbacks);
   assert.equal(maxActive, 2);
-  assert.deepEqual(calls, { "1": 1, "3": 3, "5": 1 });
+  assert.deepEqual(calls, { "1": 1, "3": 6, "4": 1, "5": 1 });
   assert.equal(h.progress.length, 3);
   assert.match(h.progress[2], /3\/3 批/);
   const content = courseContent(f.course.id);
@@ -341,7 +343,7 @@ test("按题分批并发、失败批重试后独立降级、进度按批与持�
     1,
   );
   await runQuestionExtraction(f.course.id, source, h.callbacks);
-  assert.deepEqual(calls, { "1": 1, "3": 3, "5": 1 });
+  assert.deepEqual(calls, { "1": 1, "3": 6, "4": 1, "5": 1 });
   assert.equal(courseContent(f.course.id).questions.length, 5);
   assert.ok(
     questionSimilarity("速率距离", "速率与距离") >
@@ -365,8 +367,242 @@ test("模型遗漏题目触发批重试，规则恢复全部原题", async () =>
     ],
     hooks().callbacks,
   );
-  assert.equal(calls, 3);
+  assert.equal(calls, 9);
   assert.equal(courseContent(f.course.id).questions.length, 2);
+});
+
+test("10→5→1 拆批保留模型成功题，仅最终失败题使用规则；诊断保存脱敏截断原文与路径", async () => {
+  const f = fixture();
+  const sizes: number[] = [];
+  process.env.IMPORT_QUESTION_BATCH = "10";
+  process.env.TEST_DIAGNOSTIC_SECRET = "synthetic-sensitive-secret";
+  globalThis.fetch = async (_, init) => {
+    const original = JSON.parse(
+      JSON.parse(init!.body as string).messages[1].content.split("\n原文：")[1],
+    );
+    sizes.push(original.length);
+    return response({
+      questions: original.map((q: { id: string }) => ({
+        sourceQuestionId: q.id,
+        type:
+          original.length > 1 || q.id === "10"
+            ? "unsupported_type"
+            : "short_answer",
+        prompt: `原创概念 ${q.id}。邮箱 person@example.test 手机 13812345678 synthetic-sensitive-secret ${"x".repeat(2200)}`,
+      })),
+    });
+  };
+  try {
+    await runQuestionExtraction(
+      f.course.id,
+      [
+        {
+          sourceId: f.bank.id,
+          pages: [
+            {
+              text: Array.from(
+                { length: 10 },
+                (_, i) => `${i + 1}. 解释原创概念 ${i + 1}。`,
+              ).join("\n"),
+            },
+          ],
+        },
+      ],
+      hooks().callbacks,
+    );
+    const content = courseContent(f.course.id);
+    assert.equal(content.questions.length, 10);
+    assert.equal(sizes.filter((n) => n === 10).length, 3);
+    assert.equal(sizes.filter((n) => n === 5).length, 6);
+    assert.equal(sizes.filter((n) => n === 1).length, 12);
+    assert.equal(
+      content.importItems.filter((i) => i.status === "needs_review").length,
+      1,
+    );
+    assert.match(content.importItems[0].message!, /1 题使用规则抽取/);
+    const logs = (
+      await readFile(
+        storagePath(`courses/${f.course.id}/model-diagnostics.ndjson`),
+        "utf8",
+      )
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.ok(
+      logs.some((row) =>
+        row.issues.some(
+          (issue: { path: string }) => issue.path === "questions.0.type",
+        ),
+      ),
+    );
+    assert.ok(
+      logs.every((row) => row.rawPreview.length <= 2000 && row.truncated),
+    );
+    const saved = JSON.stringify(logs);
+    for (const sensitive of [
+      "person@example.test",
+      "13812345678",
+      "synthetic-sensitive-secret",
+    ])
+      assert.equal(saved.includes(sensitive), false);
+  } finally {
+    process.env.IMPORT_QUESTION_BATCH = "2";
+    delete process.env.TEST_DIAGNOSTIC_SECRET;
+  }
+});
+
+test("答案一轮限流也保留 pending，不仲裁/不计答案待补；队列续跑只补缺答案且隔离课程", async () => {
+  const f = fixture(),
+    other = fixture();
+  const pendingQuestion = insertQuestion(f, "Q-001");
+  const preserved = insertQuestion(f, "Q-002", {
+    answer: "已有答案",
+    verified: true,
+    answerMethod: "source",
+  });
+  insertQuestion(other, "Q-001");
+  process.env.MODEL_RATE_LIMIT_RETRIES = "1";
+  process.env.MODEL_RATE_LIMIT_BASE_MS = "1";
+  let calls = 0;
+  globalThis.fetch = async (_, init) => {
+    calls++;
+    const prompt = JSON.parse(init!.body as string).messages[1].content;
+    assert.doesNotMatch(prompt, /推导轮次：3/);
+    return prompt.includes("推导轮次：1")
+      ? new Response("limited", { status: 429 })
+      : response({ answer: "6 m", analysis: "按定义计算。" });
+  };
+  try {
+    await runQuestionAnswers(f.course.id, hooks().callbacks);
+    assert.equal(calls, 3);
+    let content = courseContent(f.course.id);
+    assert.equal(
+      content.questions.find((q) => q.id === pendingQuestion.id)?.answer,
+      null,
+    );
+    assert.equal(
+      content.importItems.find((i) => i.key === `answers:${pendingQuestion.id}`)
+        ?.status,
+      "pending",
+    );
+    assert.deepEqual(
+      importNotices(content).map((n) => n.summary),
+      ["1 题答案因限流待处理"],
+    );
+    assert.equal(courseContent(other.course.id).importItems.length, 0);
+    database()
+      .db.insert(jobs)
+      .values({
+        id: `${f.course.id}-done`,
+        courseId: f.course.id,
+        status: "done",
+        createdAt: "2026-01-01T00:00:00Z",
+      })
+      .run();
+    const resumed = enqueueImport(f.course.id);
+    assert.equal(resumed.type, "import:answers");
+    assert.equal(claimJob(f.course.id)?.id, resumed.id);
+    calls = 0;
+    globalThis.fetch = async (_, init) => {
+      calls++;
+      assert.match(
+        JSON.parse(init!.body as string).messages[1].content,
+        /步骤：答案推导/,
+      );
+      return response({ answer: ["6 m"], analysis: "按定义计算。" });
+    };
+    await importJob(resumed.id);
+    content = courseContent(f.course.id);
+    assert.equal(calls, 2);
+    assert.equal(
+      content.jobs.find((job) => job.id === resumed.id)?.status,
+      "done",
+    );
+    assert.equal(
+      content.importItems.find((i) => i.key === `answers:${pendingQuestion.id}`)
+        ?.status,
+      "done",
+    );
+    assert.equal(
+      content.questions.find((q) => q.id === pendingQuestion.id)?.answer,
+      "6 m",
+    );
+    assert.deepEqual(
+      content.questions.find((q) => q.id === preserved.id),
+      preserved,
+    );
+    assert.deepEqual(importNotices(content), []);
+  } finally {
+    delete process.env.MODEL_RATE_LIMIT_RETRIES;
+    delete process.env.MODEL_RATE_LIMIT_BASE_MS;
+  }
+});
+
+test("抽取批遇 429 耗尽时不拆批或使用规则，不写入已完成标记", async () => {
+  const f = fixture();
+  process.env.MODEL_RATE_LIMIT_RETRIES = "0";
+  process.env.MODEL_RATE_LIMIT_BASE_MS = "1";
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response("limited", { status: 429 });
+  };
+  try {
+    await assert.rejects(
+      runQuestionExtraction(
+        f.course.id,
+        [
+          {
+            sourceId: f.bank.id,
+            pages: [{ text: "1. 解释概念。\n2. 说明现象。" }],
+          },
+        ],
+        hooks().callbacks,
+      ),
+      /429/,
+    );
+    assert.equal(calls, 1);
+    assert.equal(courseContent(f.course.id).questions.length, 0);
+    assert.equal(
+      database()
+        .db.select()
+        .from(importItems)
+        .where(eq(importItems.courseId, f.course.id))
+        .all().length,
+      0,
+    );
+  } finally {
+    delete process.env.MODEL_RATE_LIMIT_RETRIES;
+    delete process.env.MODEL_RATE_LIMIT_BASE_MS;
+  }
+});
+
+test("持续限流耗尽预算后暂停本轮后续答案请求，将整条剩余队列留待续跑", async () => {
+  const f = fixture();
+  for (let i = 1; i <= 5; i++) insertQuestion(f, `Q-${i}`);
+  process.env.MODEL_RATE_LIMIT_RETRIES = "0";
+  process.env.MODEL_RATE_LIMIT_BASE_MS = "1";
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response("limited", { status: 429 });
+  };
+  try {
+    const h = hooks();
+    await runQuestionAnswers(f.course.id, h.callbacks);
+    assert.equal(calls, 2);
+    assert.equal(h.progress.length, 5);
+    const content = courseContent(f.course.id);
+    assert.equal(
+      content.importItems.filter((item) => item.status === "pending").length,
+      5,
+    );
+    assert.ok(content.questions.every((q) => q.answer === null));
+  } finally {
+    delete process.env.MODEL_RATE_LIMIT_RETRIES;
+    delete process.env.MODEL_RATE_LIMIT_BASE_MS;
+  }
 });
 test("低置信度和无匹配保持未关联，规则类型与选项修复模型输出", async () => {
   const f = fixture();

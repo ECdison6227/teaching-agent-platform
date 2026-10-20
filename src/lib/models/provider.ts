@@ -4,6 +4,11 @@ import { readSseData } from "../sse";
 import { z } from "zod";
 import { setTimeout as delay } from "node:timers/promises";
 import { parseModelJson } from "./json";
+import { modelScheduler, providerSetting, retryAfterMs } from "./scheduler";
+import {
+  recordModelDiagnostic,
+  type ModelDiagnosticContext,
+} from "./diagnostics";
 
 export type ContentPart =
   | { type: "text"; text: string }
@@ -138,12 +143,17 @@ export class ModelOutputError extends Error {
   constructor(
     message: string,
     public metrics: ModelMetrics,
+    public status?: number,
+    public kind: "schema" | "parse" | "transport" = "parse",
   ) {
     super(message);
   }
 }
 class RequestError extends Error {
-  constructor(public status: number) {
+  constructor(
+    public status: number,
+    public retryAfter = 0,
+  ) {
     super(`模型请求失败（HTTP ${status}），请检查通道配置或稍后重试`);
   }
 }
@@ -163,26 +173,30 @@ function timeoutMs() {
   const value = Number(process.env.MODEL_TIMEOUT_MS);
   return Number.isSafeInteger(value) && value > 0 ? value : 120_000;
 }
-async function backoff(attempt: number, signal?: AbortSignal) {
+function backoffMs(attempt: number) {
   const configured = Number(process.env.MODEL_RETRY_BASE_MS);
   const base = Number.isFinite(configured) && configured > 0 ? configured : 500;
-  await delay(
-    Math.min(30_000, base * 2 ** attempt) * (0.5 + Math.random()),
-    undefined,
-    { signal },
-  );
+  return Math.min(30_000, base * 2 ** attempt) * (0.5 + Math.random());
 }
-/** A single network retry budget, independent of schema/JSON retries. */
+/** Transport budgets never multiply by schema/JSON retries. */
 async function request<T>(
   cfg: ProviderConfig,
   payload: Record<string, unknown>,
   metrics: ModelMetrics,
   consume: (res: Response) => Promise<T>,
   signal?: AbortSignal,
+  streamLease?: { release?: (success?: boolean) => void },
 ): Promise<T> {
   const body = { ...payload };
-  for (let attempt = 0; ; attempt++) {
+  const scheduler = modelScheduler(cfg);
+  let networkRetries = 0,
+    rateLimitRetries = 0;
+  for (;;) {
     signal?.throwIfAborted();
+    const release = await scheduler.acquire(signal);
+    let success = false;
+    let retryDelay = 0;
+    let limited = false;
     try {
       metrics.requests++;
       const res = await fetch(`${cfg.baseUrl}/chat/completions`, {
@@ -196,6 +210,13 @@ async function request<T>(
       if (res.status === 429) metrics.rateLimits++;
       if (res.status >= 500) metrics.serverErrors++;
       if (!res.ok) {
+        if (res.status === 429) {
+          await res.body?.cancel().catch(() => {});
+          throw new RequestError(
+            429,
+            retryAfterMs(res.headers.get("retry-after")),
+          );
+        }
         const detail = await res.text();
         if (
           body.response_format &&
@@ -205,31 +226,64 @@ async function request<T>(
           unsupportedJson.add(jsonCapabilityKey(cfg));
           delete body.response_format;
           // Capability negotiation is performed at most once for this request.
-          attempt--;
           continue;
         }
-        throw new RequestError(res.status);
+        throw new RequestError(
+          res.status,
+          retryAfterMs(res.headers.get("retry-after")),
+        );
       }
-      return await consume(res);
+      const result = await consume(res);
+      success = true;
+      if (streamLease) streamLease.release = release;
+      return result;
     } catch (error) {
       if (signal?.aborted) throw error;
+      limited = error instanceof RequestError && error.status === 429;
+      if (error instanceof RequestError && limited) {
+        const base = providerSetting(cfg, "RATE_LIMIT_BASE_MS", 5000, 1);
+        const maximum = providerSetting(cfg, "RATE_LIMIT_MAX_MS", 120_000, 1);
+        retryDelay = Math.max(
+          error.retryAfter,
+          Math.min(maximum, base * 2 ** rateLimitRetries) *
+            (1 + Math.random() * 0.5),
+        );
+        scheduler.rateLimited(retryDelay);
+      }
       const retryable =
         error instanceof RequestError
           ? error.status === 408 || error.status === 429 || error.status >= 500
           : error instanceof TypeError ||
             (error instanceof Error &&
               ["TimeoutError", "AbortError"].includes(error.name));
-      if (!retryable || attempt >= 3) throw error;
+      if (
+        !retryable ||
+        (limited
+          ? rateLimitRetries >=
+            Math.min(32, providerSetting(cfg, "RATE_LIMIT_RETRIES", 8))
+          : networkRetries >= 3)
+      )
+        throw error;
+      const retry = limited ? ++rateLimitRetries : ++networkRetries;
+      if (!limited) retryDelay = backoffMs(networkRetries - 1);
       metrics.networkRetries++;
       console.info(
         JSON.stringify({
           event: "model_retry",
           provider: cfg.id,
-          retry: attempt + 1,
+          retry,
           status: error instanceof RequestError ? error.status : "network",
+          waitMs: Math.ceil(retryDelay),
+          concurrency: scheduler.concurrency,
         }),
       );
-      await backoff(attempt, signal);
+    } finally {
+      if (!success || !streamLease) release(success);
+    }
+    // 429 cooldown belongs to the shared scheduler, including the final failed attempt.
+    if (!limited && retryDelay > 0) {
+      // Other callers also wait on the channel cooldown; no permit is held while waiting.
+      await delay(retryDelay, undefined, { signal });
     }
   }
 }
@@ -254,6 +308,7 @@ export async function* chat(
     if (!cfg) throw new Error("当前没有视觉模型，请使用文字提问");
   }
   if (!cfg) throw new Error("没有配置对话模型");
+  const lease: { release?: (success?: boolean) => void } = {};
   const res = await request(
     cfg,
     {
@@ -266,21 +321,26 @@ export async function* chat(
     modelMetrics(),
     async (response) => response,
     signal,
+    lease,
   );
-  if (!res.body) throw new Error("模型没有返回响应流");
   let finished = false;
-  for await (const data of readSseData(res.body, signal)) {
-    if (data === "[DONE]") {
-      finished = true;
-      break;
+  try {
+    if (!res.body) throw new Error("模型没有返回响应流");
+    for await (const data of readSseData(res.body, signal)) {
+      if (data === "[DONE]") {
+        finished = true;
+        break;
+      }
+      const json = JSON.parse(data);
+      if (json.error) throw new Error("模型服务返回错误");
+      const delta = json.choices?.[0]?.delta?.content;
+      if (typeof delta === "string") yield delta;
+      if (json.choices?.[0]?.finish_reason) finished = true;
     }
-    const json = JSON.parse(data);
-    if (json.error) throw new Error("模型服务返回错误");
-    const delta = json.choices?.[0]?.delta?.content;
-    if (typeof delta === "string") yield delta;
-    if (json.choices?.[0]?.finish_reason) finished = true;
+    if (!finished) throw new Error("模型响应中断，请重试");
+  } finally {
+    lease.release?.(finished);
   }
-  if (!finished) throw new Error("模型响应中断，请重试");
 }
 export async function structured<S extends z.ZodTypeAny>(
   task: ModelTask,
@@ -291,6 +351,8 @@ export async function structured<S extends z.ZodTypeAny>(
     retries?: number;
     temperature?: number;
     onMetrics?: (metrics: ModelMetrics) => void;
+    normalize?: (value: unknown) => unknown;
+    diagnostic?: ModelDiagnosticContext;
   } = {},
 ): Promise<{
   data: z.output<S>;
@@ -304,6 +366,7 @@ export async function structured<S extends z.ZodTypeAny>(
   const metrics = modelMetrics();
   const start = performance.now();
   let lastError: unknown;
+  let failureKind: ModelOutputError["kind"] = "parse";
   try {
     for (
       let attempt = 0;
@@ -353,17 +416,42 @@ export async function structured<S extends z.ZodTypeAny>(
         );
       } catch (error) {
         // Exhausted transport retries must not multiply by the parsing budget.
-        if (!(error instanceof SyntaxError)) throw error;
+        if (!(error instanceof SyntaxError)) {
+          failureKind = "transport";
+          throw error;
+        }
         lastError = error;
         if (attempt < Math.max(2, options.retries ?? 2)) metrics.parseRetries++;
         continue;
       }
+      const raw = body?.choices?.[0]?.message?.content;
+      let normalized = false;
       try {
-        if (body.choices?.[0]?.finish_reason === "length")
+        if (body?.choices?.[0]?.finish_reason === "length")
           throw new Error("模型 JSON 已截断");
-        const raw = body.choices?.[0]?.message?.content;
         if (typeof raw !== "string") throw new Error("模型没有返回结构化内容");
-        const data = schema.parse(parseModelJson(raw));
+        const parsed = parseModelJson(raw);
+        const canonical = options.normalize
+          ? options.normalize(parsed)
+          : parsed;
+        normalized = options.normalize
+          ? JSON.stringify(canonical) !== JSON.stringify(parsed)
+          : false;
+        const data = schema.parse(canonical);
+        if (normalized && options.diagnostic) {
+          const original = schema.safeParse(parsed);
+          if (!original.success)
+            await recordModelDiagnostic(options.diagnostic, {
+              task,
+              provider: cfg.id,
+              model: cfg.model,
+              attempt: attempt + 1,
+              raw,
+              error: original.error,
+              normalized: true,
+              recovered: true,
+            });
+        }
         return {
           data,
           model: `${cfg.id}:${cfg.model}`,
@@ -372,6 +460,17 @@ export async function structured<S extends z.ZodTypeAny>(
         };
       } catch (error) {
         lastError = error;
+        failureKind = error instanceof z.ZodError ? "schema" : "parse";
+        if (options.diagnostic)
+          await recordModelDiagnostic(options.diagnostic, {
+            task,
+            provider: cfg.id,
+            model: cfg.model,
+            attempt: attempt + 1,
+            raw: typeof raw === "string" ? raw : "",
+            error,
+            normalized,
+          });
         if (attempt < Math.max(2, options.retries ?? 2)) metrics.parseRetries++;
       }
     }
@@ -384,6 +483,8 @@ export async function structured<S extends z.ZodTypeAny>(
           ? error.message
           : "模型返回无效内容",
       metrics,
+      error instanceof RequestError ? error.status : undefined,
+      failureKind,
     );
   } finally {
     metrics.elapsedMs = Math.round(performance.now() - start);

@@ -235,7 +235,7 @@ export function ReviewDesk({ initial }: { initial: CourseContent }) {
           <p className="text-muted-foreground">未上传或未抽取到习题。</p>
         )}
         {sortedQuestions.map((q) => (
-          <Card key={q.id}>
+          <Card key={q.id} id={`question-${q.id}`} className="scroll-mt-12">
             <CardHeader>
               <CardTitle>
                 {q.code} · {q.verified ? "已核对" : "待核对"}

@@ -46,6 +46,8 @@ async function main() {
     VISION_MODEL_PROVIDER: "openai-compatible",
     NEXT_TELEMETRY_DISABLED: "1",
     MODEL_RETRY_BASE_MS: "1",
+    MODEL_RATE_LIMIT_BASE_MS: "1",
+    MODEL_RATE_LIMIT_RETRIES: "3",
   };
   for (const task of ["CHAT", "STRUCTURE", "NOTES", "TEXTBOOK", "QUESTIONS"])
     Object.assign(env, {
@@ -568,6 +570,85 @@ async function main() {
     assert.deepEqual(pageErrors, []);
     console.log(
       "PASS formulas: original OMML DOCX -> PDF/page images -> LaTeX in textbook, question and options; review flags missing formulas; mock vision + CLI formula-only recovery preserves pages",
+    );
+    // 原创测试标记只写入本次 DATA_DIR，验证聚合、默认折叠、审核定位和待处理续跑。
+    const noticeDb = new Database(path.join(runDir, "platform.sqlite"));
+    noticeDb.transaction(() => {
+      noticeDb
+        .prepare("DELETE FROM import_items WHERE course_id = ?")
+        .run(course.id);
+      const insert = noticeDb.prepare(
+        "INSERT INTO import_items (course_id, key, status, message) VALUES (?, ?, ?, ?)",
+      );
+      for (let i = 0; i < 7; i++)
+        insert.run(
+          course.id,
+          `questions:notice:${i}`,
+          "needs_review",
+          "该批习题使用规则抽取，待核对",
+        );
+      for (let i = 0; i < 6; i++)
+        insert.run(
+          course.id,
+          `answers:notice-${i}`,
+          "needs_review",
+          "答案未能可靠推导",
+        );
+      insert.run(
+        course.id,
+        `answers:${missingAnswer.id}`,
+        "pending",
+        "上游限流，答案待处理，可续跑",
+      );
+    })();
+    noticeDb.close();
+    await page.goto(base + `/c/${course.slug}`);
+    await expect(
+      page.getByText(
+        "7 批习题使用规则抽取 · 6 题答案待补 · 1 题答案因限流待处理",
+        { exact: true },
+      ),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "展开明细" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    await expect(page.locator("#import-notice-details")).toHaveCount(0);
+    await page.getByRole("button", { name: "展开明细" }).click();
+    await expect(
+      page.getByRole("button", { name: "收起明细" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    const reviewLink = page.locator(
+      `#import-notice-details a[href$="#question-${missingAnswer.id}"]`,
+    );
+    await expect(reviewLink).toHaveText("前往审核");
+    await reviewLink.click();
+    await expect(
+      page.locator(`#question-${missingAnswer.id}`),
+    ).toBeInViewport();
+    await page.goto(base + `/c/${course.slug}`);
+    const pendingResume = page.waitForResponse(
+      (r) =>
+        r.url() === base + `/api/courses/${course.id}/jobs` &&
+        r.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: "续跑待处理答案" }).click();
+    const answerJob = await (await pendingResume).json();
+    assert.equal(answerJob.type, "import:answers");
+    await runWorker();
+    await checkJob(answerJob.id);
+    const afterAnswerResume = await json<CourseContent>(
+      `/api/courses/${course.id}`,
+    );
+    assert.equal(
+      afterAnswerResume.importItems.find(
+        (item) => item.key === `answers:${missingAnswer.id}`,
+      )?.status,
+      "needs_review",
+    );
+    assert.equal(afterAnswerResume.questions.length, content.questions.length);
+    assert.deepEqual(pageErrors, []);
+    console.log(
+      "PASS FIX6 UI: 7 batches + 6 missing answers aggregate, details collapsed by default, review anchor navigation, pending 429 answer resumes through queued answers-only job",
     );
     await writeFile(
       path.join(runDir, "result.json"),

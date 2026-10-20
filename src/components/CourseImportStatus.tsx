@@ -6,17 +6,19 @@ import type { CourseContent } from "@/lib/courses";
 import { appPath } from "@/lib/app-path";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
+import { ChevronDown, ChevronUp } from "lucide-react";
+import { importNotices } from "@/lib/import-notices";
 
 export function CourseImportStatus({ data }: { data: CourseContent }) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState(false);
   const job = data.jobs[0];
   const active = job && ["queued", "running"].includes(job.status);
   const failed = job?.status === "failed" || data.course.status === "failed";
-  const pending = data.importItems.filter(
-    (item) => item.status === "needs_review",
-  );
+  const notices = importNotices(data);
+  const deferred = notices.some((group) => group.type === "rate_limit");
   useEffect(() => {
     if (!active) return;
     const timer = setInterval(() => router.refresh(), 3000);
@@ -38,7 +40,7 @@ export function CourseImportStatus({ data }: { data: CourseContent }) {
       setBusy(false);
     }
   }
-  if (data.course.status === "ready" && !active && !pending.length) return null;
+  if (data.course.status === "ready" && !active && !notices.length) return null;
   return (
     <Card className="mx-4 mt-4 shadow-none sm:mx-8">
       <CardContent className="space-y-3 p-4">
@@ -59,15 +61,59 @@ export function CourseImportStatus({ data }: { data: CourseContent }) {
             className="h-2 w-full accent-emerald-700"
           />
         )}
-        {pending.length > 0 && (
+        {notices.length > 0 && (
           <p className="text-sm text-muted-foreground">
-            {pending.map((item) => item.message).join("；")}
+            {notices.map((group) => group.summary).join(" · ")}
           </p>
         )}
+        {notices.length > 0 && (
+          <div>
+            <Button
+              size="sm"
+              variant="ghost"
+              aria-expanded={expanded}
+              aria-controls="import-notice-details"
+              onClick={() => setExpanded(!expanded)}
+            >
+              {expanded ? <ChevronUp /> : <ChevronDown />}{" "}
+              {expanded ? "收起明细" : "展开明细"}
+            </Button>
+            {expanded && (
+              <div
+                id="import-notice-details"
+                className="max-h-64 space-y-3 overflow-y-auto py-2 text-sm"
+              >
+                {notices.map((group) => (
+                  <div key={group.label}>
+                    <p className="font-medium">{group.summary}</p>
+                    <ul className="list-inside list-disc text-muted-foreground">
+                      {group.items.map((item) => (
+                        <li key={item.key}>
+                          {item.message}{" "}
+                          <Link
+                            className="underline"
+                            href={`/teach/${data.course.id}/review${item.questionId ? `#question-${item.questionId}` : ""}`}
+                          >
+                            前往审核
+                          </Link>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         <div className="flex flex-wrap gap-2">
-          {failed && (
+          {(failed || deferred) && !active && (
             <Button size="sm" disabled={busy} onClick={() => void resume()}>
-              从失败处继续
+              {failed ? "从失败处继续" : "续跑待处理答案"}
+            </Button>
+          )}
+          {notices.length > 0 && (
+            <Button asChild size="sm" variant="outline">
+              <Link href={`/teach/${data.course.id}/review`}>打开审核台</Link>
             </Button>
           )}
           <Button asChild size="sm" variant="outline">

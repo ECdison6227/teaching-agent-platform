@@ -11,15 +11,24 @@ import {
 } from "../src/lib/import-schemas";
 
 const originalFetch = globalThis.fetch;
+let scenario = 0;
 after(() => {
   globalThis.fetch = originalFetch;
 });
 beforeEach(() => {
   process.env.MODEL_PROVIDER = "openai-compatible";
-  process.env.OPENAI_BASE_URL = "http://model.test/v1";
+  process.env.OPENAI_BASE_URL = `http://model-${++scenario}.test/v1`;
   process.env.OPENAI_CHAT_MODEL = "test-json";
   process.env.OPENAI_JSON_MODE = "auto";
   process.env.MODEL_RETRY_BASE_MS = "1";
+  process.env.MODEL_RATE_LIMIT_BASE_MS = "1";
+  for (const key of [
+    "OPENAI_RATE_LIMIT_RETRIES",
+    "MODEL_RATE_LIMIT_RETRIES",
+    "OPENAI_RATE_LIMIT_BASE_MS",
+    "MODEL_CONCURRENCY",
+  ])
+    delete process.env[key];
   delete process.env.MODEL_TIMEOUT_MS;
 });
 function envelope(raw: string, finish_reason = "stop") {
@@ -110,7 +119,16 @@ test("持续解析失败至少重试两次并带有计数", async () => {
   );
   assert.equal(calls, 3);
 });
-test("网络错误、429、5xx 共用三次指数退避重试，无额外解析重试放大", async () => {
+test("空响应包络作为解析失败重试，不绕过结构化重试预算", async () => {
+  let calls = 0;
+  globalThis.fetch = async () =>
+    ++calls === 1 ? Response.json(null) : envelope('{"content_md":"ok"}');
+  const result = await structured("textbook", TextbookSchema, "input");
+  assert.equal(calls, 2);
+  assert.equal(result?.data.content_md, "ok");
+  assert.equal(result?.metrics.parseRetries, 1);
+});
+test("网络错误、429、5xx 的传输重试无额外解析重试放大", async () => {
   let calls = 0;
   globalThis.fetch = async () => {
     calls++;
@@ -224,4 +242,78 @@ test("chat 初始网络请求同样重试，用户停止不重试", async () => 
     for await (const piece of chat([], controller.signal)) void piece;
   });
   assert.equal(calls, 0);
+});
+
+test("429 遵守 Retry-After，默认重试多于三次，耗尽后保留 HTTP 状态且不乘解析预算", async () => {
+  let calls = 0;
+  const starts: number[] = [];
+  globalThis.fetch = async () => {
+    starts.push(Date.now());
+    calls++;
+    return calls <= 4
+      ? new Response("limited", {
+          status: 429,
+          headers: { "Retry-After": calls === 1 ? "1" : "0" },
+        })
+      : envelope('{"content_md":"ok"}');
+  };
+  const result = await structured("textbook", TextbookSchema, "input");
+  assert.equal(calls, 5);
+  assert.ok(starts[1] - starts[0] >= 1000);
+  assert.equal(result?.metrics.rateLimits, 4);
+  assert.equal(result?.metrics.parseRetries, 0);
+  process.env.OPENAI_RATE_LIMIT_RETRIES = "1";
+  process.env.MODEL_RATE_LIMIT_RETRIES = "6";
+  calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response("limited", { status: 429 });
+  };
+  await assert.rejects(
+    structured("textbook", TextbookSchema, "input"),
+    (error: unknown) =>
+      error instanceof ModelOutputError &&
+      error.status === 429 &&
+      error.kind === "transport" &&
+      error.metrics.parseRetries === 0,
+  );
+  assert.equal(calls, 2);
+});
+
+test("chat 等待全局限流冷却时可立即取消", async () => {
+  globalThis.fetch = async () =>
+    new Response("limited", { status: 429, headers: { "Retry-After": "60" } });
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new Error("user stopped")),
+    20,
+  );
+  try {
+    await assert.rejects(async () => {
+      for await (const chunk of chat([], controller.signal)) void chunk;
+    }, /abort|user stopped/i);
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+test("聊天流与结构化任务共享并发许可，流退出后才启动排队请求", async () => {
+  process.env.MODEL_CONCURRENCY = "1";
+  let calls = 0;
+  globalThis.fetch = async (_, init) => {
+    calls++;
+    return JSON.parse(init!.body as string).stream
+      ? new Response(
+          'data: {"choices":[{"delta":{"content":"first"}}]}\n\ndata: [DONE]\n\n',
+        )
+      : envelope('{"content_md":"ok"}');
+  };
+  const stream = chat([], AbortSignal.timeout(5000));
+  assert.equal((await stream.next()).value, "first");
+  const queued = structured("textbook", TextbookSchema, "input");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(calls, 1);
+  await stream.return(undefined);
+  assert.equal((await queued)?.data.content_md, "ok");
+  assert.equal(calls, 2);
 });

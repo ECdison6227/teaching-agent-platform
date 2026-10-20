@@ -316,7 +316,7 @@ test("单项讲义和习题批次最终解析失败后仍处理后续项", async
   assert.equal(result.jobs[0].status, "done");
   assert.equal(calls["textbook:K1"], 3);
   assert.equal(calls["textbook:K2"], 1);
-  assert.equal(calls["questions:1"], 3);
+  assert.equal(calls["questions:1"], 9);
   assert.equal(calls["questions:7"], 1);
   assert.match(result.knowledgePoints[0].contentMd, /待核对/);
   assert.match(result.knowledgePoints[1].contentMd, /Verified source formula/);

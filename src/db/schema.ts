@@ -204,7 +204,9 @@ export const importItems = sqliteTable(
       .notNull()
       .references(() => courses.id, { onDelete: "cascade" }),
     key: text("key").notNull(),
-    status: text("status", { enum: ["done", "needs_review"] }).notNull(),
+    status: text("status", {
+      enum: ["done", "needs_review", "pending"],
+    }).notNull(),
     message: text("message"),
   },
   (t) => [uniqueIndex("import_item_course_key").on(t.courseId, t.key)],

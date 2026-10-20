@@ -268,13 +268,31 @@ export function enqueueImport(courseId: string) {
         .where(eq(jobs.courseId, courseId))
         .orderBy(desc(jobs.createdAt))
         .get();
+      const deferredAnswers =
+        previous?.status === "done" &&
+        db
+          .select()
+          .from(importItems)
+          .where(
+            and(
+              eq(importItems.courseId, courseId),
+              eq(importItems.status, "pending"),
+              like(importItems.key, "answers:%"),
+            ),
+          )
+          .get();
       return db
         .insert(jobs)
         .values({
           id: uid(),
           courseId,
           createdAt: now(),
-          type: previous?.status === "failed" ? previous.type : "import",
+          type:
+            previous?.status === "failed"
+              ? previous.type
+              : deferredAnswers
+                ? "import:answers"
+                : "import",
         })
         .returning()
         .get();

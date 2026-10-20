@@ -126,15 +126,19 @@ OPENAI_VISION_MODEL=your-vision-model
 
 此地址可以连接 `npm run mock:model` 启动的本地假模型。真实服务换为自己的 API 地址、模型名和密钥，地址包含 API 前缀但不包含 `/chat/completions`。
 
-习题规则识别 choice / truefalse / fill / calc / short，使用大题标题作为类型提示；支持全角/半角题号、`A．` / `A.` / `A、` / `（A）` 与一行多选项，保留公式。抽取以原题边界分批并发，按完成批数推进进度；单批失败重试后只降级该批，批检查点包括空结果。知识点按标题、关键词、讲义和题干相似度提供候选，由模型返回课程内的 `kpId` 与置信度；无匹配、非法 ID 或低于阈值时保留未关联，不回退到首个知识点。
+习题规则识别 choice / truefalse / fill / calc / short，使用大题标题作为类型提示；支持全角/半角题号、`A．` / `A.` / `A、` / `（A）` 与一行多选项，保留公式。抽取以原题边界分批并发，按完成批数推进进度；模型输出先归一化字段别名、字符串/字典选项、答案数组、数值字符串、常见题型枚举和多余包裹层，再做 Zod 校验。缺少必要题干、未知题型、遗漏题目等仍会失败；解析/校验重试后拆小批（默认 10→5→1），仅最终失败的题使用规则抽取，保留其余题的模型结果，批检查点包括空结果。429 不拆批、不规则降级，以免放大限流。知识点按标题、关键词、讲义和题干相似度提供候选，由模型返回课程内的 `kpId` 与置信度；无匹配、非法 ID 或低于阈值时保留未关联，不回退到首个知识点。
 
-缺答案题目使用相同的 `QUESTIONS_MODEL_PROVIDER` / `QUESTIONS_MODEL` 独立推导两轮（不同提示、温度 0.1 与 0.6，不互相提供答案），一致则保存 answer / analysis 和 high 置信度；不一致或仅一轮有效时以温度 0.2 仲裁，结果为 low 且仍标 `needs_review`。所有自动推导结果都保持未核对；资料不足、响应失败或无效选项答案时留空。不会自动切换其他通道。
+缺答案题目使用相同的 `QUESTIONS_MODEL_PROVIDER` / `QUESTIONS_MODEL` 独立推导两轮（不同提示、温度 0.1 与 0.6，不互相提供答案），一致则保存 answer / analysis 和 high 置信度；不一致或仅一轮有效时以温度 0.2 仲裁，结果为 low 且仍标 `needs_review`。所有自动推导结果都保持未核对；资料不足、响应失败或无效选项答案时留空。任一必需轮次的 429 预算耗尽时，持久化为 `import_items.status=pending`，不计入“答案无法推导”，不再发起仲裁。课程页可点“续跑待处理答案”，队列只执行答案步骤；也可使用 `npm run import:resume -- <courseId> --from answers`。两者均跳过已有答案，不会自动切换其他通道。顶部通知按类型计数（如“7 批习题使用规则抽取 · 6 题答案待补”），明细默认折叠，可展开跳转审核台并定位到对应题目。
 
 不同任务可分配到不同通道：`CHAT_MODEL_PROVIDER`、`STRUCTURE_MODEL_PROVIDER`、`NOTES_MODEL_PROVIDER`、`TEXTBOOK_MODEL_PROVIDER`、`QUESTIONS_MODEL_PROVIDER`。对应的 `*_MODEL` 可覆盖文本模型名，`VISION_MODEL_PROVIDER` 单独选择视觉通道。通道还支持 `*_VISION_BASE_URL` / `*_VISION_API_KEY` / `*_VISION_MODEL`；没有可用视觉模型时使用文本。扫描页有视觉模型时进行转录，没有时保留页图并提示待补充。
 
-结构化响应优先请求 `response_format: {type: "json_object"}`；通道明确返回不支持时自动降级并按模型缓存能力，也可设置通道的 `*_JSON_MODE=off`（通用兼容通道为 `OPENAI_JSON_MODE=off`）。统一解析器处理 JSON 围栏、前后说明、LaTeX 反斜杠/非法转义和字符串内控制字符；检测未闭合内容与 `finish_reason=length`，不猜补截断结果。所有结构化步骤经 Zod 校验，解析/校验失败重试 2 次，最终只降级该知识点讲义/该批习题/该页或规则章节结构并标记待核对，不中止课程。逐页 OCR / 要点以 `rules:model-failed` 标记失败降级，无模型时为 `rules:no-model`。网络错误、超时、408、429 和 5xx 在 provider 层指数退避重试 3 次并加抖动；网络预算耗尽后直接降级，避免再乘以解析重试预算。默认单次超时 `MODEL_TIMEOUT_MS=120000`，退避基数 `MODEL_RETRY_BASE_MS=500` 毫秒，最大 30 秒后加 0.5–1.5 倍抖动；401 等永久错误不重试。模型要点的标题、要点、关键词使用 `courses.language`（默认 `zh`），专业术语可括注英文，转录原文保留原语言。标题去除尾随标点，并要求模型根据内容拟题，页码占位标题会触发重试。逐页公式进行 KaTeX 格式检查。知识点划分温度为 0.2，数量范围随页数变化（长课程为 8–20 项），验证章节顺序、完整且不重复的连续页段，禁止习题/小结/问题类栏目作为知识点；无效时重试再按连续页段降级。
+结构化响应优先请求 `response_format: {type: "json_object"}`；通道明确返回不支持时自动降级并按模型缓存能力，也可设置通道的 `*_JSON_MODE=off`（通用兼容通道为 `OPENAI_JSON_MODE=off`）。统一解析器处理 JSON 围栏、前后说明、LaTeX 反斜杠/非法转义和字符串内控制字符；检测未闭合内容与 `finish_reason=length`，不猜补截断结果。所有结构化步骤经 Zod 校验，解析/校验失败重试 2 次，习题另按上文拆批；最终降级项标记待核对。逐页 OCR / 要点以 `rules:model-failed` 标记失败降级，无模型时为 `rules:no-model`。普通网络错误、超时、408 和 5xx 在 provider 层指数退避重试 3 次；429 使用独立预算，避免网络预算再乘以解析重试预算。默认单次超时 `MODEL_TIMEOUT_MS=120000`，普通退避基数 `MODEL_RETRY_BASE_MS=500` 毫秒，最大 30 秒后加 0.5–1.5 倍抖动；401 等永久错误不重试。模型要点的标题、要点、关键词使用 `courses.language`（默认 `zh`），专业术语可括注英文，转录原文保留原语言。标题去除尾随标点，并要求模型根据内容拟题，页码占位标题会触发重试。逐页公式进行 KaTeX 格式检查。知识点划分温度为 0.2，数量范围随页数变化（长课程为 8–20 项），验证章节顺序、完整且不重复的连续页段，禁止习题/小结/问题类栏目作为知识点；无效时重试再按连续页段降级。
 
-worker 每页输出 JSON 日志 `event=import_page`，包含阶段、耗时、模型耗时、SQLite 入库耗时、请求数、网络/解析重试数、429 和 5xx 次数；缓存命中阶段不重复计算模型请求。provider 的 `model_retry` 日志记录退避重试状态，不记录提示词、响应原文或密钥。
+429 默认重试 `MODEL_RATE_LIMIT_RETRIES=8` 次，以 `MODEL_RATE_LIMIT_BASE_MS=5000` 毫秒指数退避，基数封顶 `MODEL_RATE_LIMIT_MAX_MS=120000` 后再加 0–50% 抖动；`Retry-After` 秒数或 HTTP 日期始终作为等待下限。同一进程内所有模型任务共享按通道（provider + endpoint）的调度，默认 `MODEL_CONCURRENCY=4`，429 将并发减半（最低 1），通道内其他请求也遵守冷却。连续成功至少 `MODEL_RECOVERY_SUCCESSES=8` 次且经过 `MODEL_RECOVERY_MS=30000` 毫秒后，每次只回升 1。`MODEL_RPM=0` 表示不预设速率；正数将发送时间平滑分隔。以上设置均可用通道前缀覆盖，例如 `AGNES_RPM=30`、`AGNES_CONCURRENCY=2`、`AGNES_RATE_LIMIT_RETRIES=10`；通用兼容通道前缀为 `OPENAI`。多个独立进程需分别分配 RPM 预算。
+
+同一轮答案任务耗尽限流预算后，不再为尚未启动的题逐个发起请求；这些题统一保留为可续跑待处理，在途任务结束后显示处理摘要，避免持续限流时整条队列反复等待。
+
+worker 每页输出 JSON 日志 `event=import_page`，包含阶段、耗时、模型耗时、SQLite 入库耗时、请求数、网络/解析重试数、429 和 5xx 次数；缓存命中阶段不重复计算模型请求。provider 的 `model_retry` 日志记录状态、等待毫秒数及当前并发，不记录提示词或响应原文。习题抽取/答案的解析校验诊断保存在 `DATA_DIR/courses/<courseId>/model-diagnostics.ndjson`：包括课程/批次、通道/模型、重试序号、Zod 错误路径、原始长度和最多 2000 字符的脱敏原始输出；已被归一化修复的形态也记录原始校验问题。过滤联系信息、环境变量中的密钥及常见凭据字段。控制台仅记录错误路径及诊断相对路径；诊断文件不能提交。
 
 Job 记录本次任务成功响应报告的 token 用量；不推算失败调用或不报告 usage 的用量。聊天通过 OpenAI 兼容 SSE 协议，支持停止、重试及交互题卡。
 

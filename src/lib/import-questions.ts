@@ -11,8 +11,12 @@ import {
 import { uid } from "./courses";
 import { redactPII } from "./storage";
 import { formulaGapReasons, type FormulaRecovery } from "./formulas";
-import { structured } from "./models/provider";
+import { structured, ModelOutputError } from "./models/provider";
 import { QuestionsSchema, QuestionAnswerSchema } from "./import-schemas";
+import {
+  normalizeQuestionsOutput,
+  normalizeAnswerOutput,
+} from "./question-normalization";
 import {
   importQuestionBatch,
   importQuestionConcurrency,
@@ -37,6 +41,11 @@ type Hooks = {
   progress: (value: number, step: string) => void;
   tokens: (amount: number) => void;
 };
+type ExtractedItem = {
+  data: (typeof QuestionsSchema._output.questions)[number];
+  ruleBased: boolean;
+};
+type BatchResult = { items: ExtractedItem[]; ruleBased: boolean };
 function questionContext(courseId: string) {
   const { db } = database();
   const coursePages = db
@@ -121,7 +130,8 @@ async function extractBatch(
   batch: QuestionBoundary[],
   courseId: string,
   context: Context,
-) {
+  hooks: Hooks,
+): Promise<BatchResult> {
   const numbered = batch.filter((q) => q.numbered);
   const schema = QuestionsSchema.superRefine((output, ctx) => {
     if (!numbered.length) return;
@@ -134,6 +144,7 @@ async function extractBatch(
     )
       ctx.addIssue({
         code: "custom",
+        path: ["questions"],
         message: "必须逐题返回当前批全部题目，并保留 sourceQuestionId",
       });
   });
@@ -153,12 +164,66 @@ async function extractBatch(
     })),
   }));
   try {
-    return await structured(
+    const result = await structured(
       "questions",
       schema,
       `课程 ID：${courseId}。步骤：习题抽取与知识点关联。只抽原文已有题目，不编题，本步骤不推导答案。按题目边界逐题返回，不合并、不遗漏。\n返回 {"questions":[{"sourceQuestionId":"原题id","type":"choice|truefalse|fill|calc|short","prompt":"去除题号与选项的题干","options":[{"id":"A","text":"选项"}],"answer":null,"analysis":"原文解析或空字符串","kpId":null,"kpConfidence":0,"pages":[],"sourcePage":1,"confidence":"high|mid|low"}]}。识别 A．/A./A、/（A）及行内多选项，选项只能放 options；公式保留原样或合法 LaTeX。typeHint 是大题标题提示。缺答案必须 null。判断答案 T/F。\n知识点必须根据标题、关键词、讲义、页要点与题意的相似度判断，返回候选中的 kpId 与 0–1 置信度。课程没有对应概念时 kpId=null，不能挂到宽泛或相邻主题。pages 只引用匹配知识点的真实课件页码。\n共享知识点资料：${JSON.stringify(referenceIndex)}\n原文：${JSON.stringify(batch.map((q) => ({ page: q.page, id: q.id, typeHint: q.typeHint, text: q.text, preprocessed: q.numbered ? ruleQuestion(q) : undefined, candidates: candidates.get(q.id)?.map(({ kpId, title, keywords, similarity }) => ({ kpId, title, keywords, similarity, pagePoints: referenceIndex.find((r) => r.kpId === kpId)?.pagePoints.map((p) => ({ page: p.page })) })) })))}`,
+      undefined,
+      {
+        normalize: normalizeQuestionsOutput,
+        diagnostic: {
+          courseId,
+          item: `extract:${batch.map((q) => q.id).join(",")}`,
+        },
+      },
     );
+    hooks.tokens(result?.tokens || 0);
+    if (result)
+      return {
+        ruleBased: false,
+        items: result.data.questions.map((data, index) => ({
+          data: {
+            ...data,
+            sourceQuestionId:
+              data.sourceQuestionId ??
+              (result.data.questions.length === batch.length
+                ? batch[index].id
+                : undefined),
+          },
+          ruleBased: false,
+        })),
+      };
   } catch (error) {
+    // Splitting a throttled request would amplify upstream load.
+    if (error instanceof ModelOutputError && error.status === 429) throw error;
+    if (
+      batch.length > 1 &&
+      error instanceof ModelOutputError &&
+      error.kind !== "transport"
+    ) {
+      const size = batch.length > 5 ? Math.ceil(batch.length / 2) : 1;
+      console.info(
+        JSON.stringify({
+          event: "import_question_batch_split",
+          courseId,
+          size: batch.length,
+          retrySize: size,
+        }),
+      );
+      const recovered: BatchResult = { items: [], ruleBased: false };
+      // Sequential sub-batches keep a failed batch from multiplying concurrency.
+      for (let start = 0; start < batch.length; start += size) {
+        const result = await extractBatch(
+          batch.slice(start, start + size),
+          courseId,
+          context,
+          hooks,
+        );
+        recovered.items.push(...result.items);
+        recovered.ruleBased ||= result.ruleBased;
+      }
+      return recovered;
+    }
     console.warn(
       JSON.stringify({
         event: "import_question_batch_fallback",
@@ -166,8 +231,13 @@ async function extractBatch(
         error: error instanceof Error ? error.message : "模型抽取失败",
       }),
     );
-    return null;
   }
+  return {
+    ruleBased: true,
+    items: batch
+      .filter((q) => q.numbered)
+      .map((q) => ({ data: ruleQuestion(q), ruleBased: true })),
+  };
 }
 export function normalizeQuestionAnswer(
   question: { type: Question["type"]; options?: Question["options"] },
@@ -199,6 +269,7 @@ async function deriveAnswer(
   context: Context,
   hooks: Hooks,
 ) {
+  let rateLimited = false;
   const material = references(question.prompt, context, question.kpId);
   const base = `课程 ID：${courseId}。步骤：答案推导（独立于抽取）。依据当前课程讲义与页要点推导原题答案。仅用配置的当前 questions 模型通道。资料不足或题目条件不全，answer=null，analysis 说明原因；不假装原文提供答案。只返回 {"answer":"最终答案或null","analysis":"供学生核对的简明解法与依据"}。choice 仅返回选项 ID，truefalse 仅返回 T/F，其他题型返回完整结果（保留单位/公式）。\n题目：${JSON.stringify({ type: question.type, prompt: question.prompt, options: question.options })}\n课程依据：${JSON.stringify(material)}`;
   const attempt = async (
@@ -212,16 +283,24 @@ async function deriveAnswer(
         QuestionAnswerSchema,
         `${base}\n推导轮次：${round}。${instruction}`,
         undefined,
-        { temperature },
+        {
+          temperature,
+          normalize: normalizeAnswerOutput,
+          diagnostic: { courseId, item: `answer:${question.id}:${round}` },
+        },
       );
       hooks.tokens(result?.tokens || 0);
       if (!result) return null;
       const answer = normalizeQuestionAnswer(question, result.data.answer);
       return answer ? { answer, analysis: result.data.analysis } : null;
     } catch (error) {
+      if (error instanceof ModelOutputError && error.status === 429)
+        rateLimited = true;
       console.warn(
         JSON.stringify({
-          event: "import_question_answer_failed",
+          event: rateLimited
+            ? "import_question_answer_deferred"
+            : "import_question_answer_failed",
           courseId,
           questionId: question.id,
           round,
@@ -236,6 +315,7 @@ async function deriveAnswer(
     attempt(1, "从定义和已知条件出发，独立求解，并检查答案满足条件。", 0.1),
     attempt(2, "换一种解法或反向验算，独立求解，尤其检查干扰选项与单位。", 0.6),
   ]);
+  if (rateLimited) return { pending: true as const };
   const canonical = (text: string) =>
     text.normalize("NFKC").replace(/\s+/g, "");
   if (first && second && canonical(first.answer) === canonical(second.answer))
@@ -251,6 +331,7 @@ async function deriveAnswer(
     `两轮独立推导未达成一致。逐项检查下面两份结果与课程依据，独立裁决，不做多数猜测；无法确定时返回 null。候选：${JSON.stringify([first, second])}。仲裁结果仍需人工核对。`,
     0.2,
   );
+  if (rateLimited) return { pending: true as const };
   return arbitration
     ? {
         ...arbitration,
@@ -274,10 +355,28 @@ export async function runQuestionAnswers(courseId: string, hooks: Hooks) {
         !q.verified &&
         q.formulaRecovery?.status !== "missing",
     );
+  let throttled = false;
   await mapImportPages(
     pending,
     async (question) => {
-      const result = await deriveAnswer(question, courseId, context, hooks);
+      // Once this run exhausts the 429 budget, leave the remaining queue resumable.
+      // In-flight independent rounds still settle before the worker finishes.
+      const derived = throttled
+        ? { pending: true as const }
+        : await deriveAnswer(question, courseId, context, hooks);
+      const deferred = !!derived && "pending" in derived;
+      throttled ||= deferred;
+      const result = derived && !("pending" in derived) ? derived : null;
+      const status = result
+        ? ("done" as const)
+        : deferred
+          ? ("pending" as const)
+          : ("needs_review" as const);
+      const message = result
+        ? null
+        : deferred
+          ? "上游限流，答案待处理，可续跑"
+          : "答案未能可靠推导，可从 answers 步骤续跑或人工补充";
       db.transaction((tx) => {
         if (result)
           tx.update(questions)
@@ -299,18 +398,14 @@ export async function runQuestionAnswers(courseId: string, hooks: Hooks) {
           .values({
             courseId,
             key: `answers:${question.id}`,
-            status: result ? "done" : "needs_review",
-            message: result
-              ? null
-              : "答案未能可靠推导，可从 answers 步骤续跑或人工补充",
+            status,
+            message,
           })
           .onConflictDoUpdate({
             target: [importItems.courseId, importItems.key],
             set: {
-              status: result ? "done" : "needs_review",
-              message: result
-                ? null
-                : "答案未能可靠推导，可从 answers 步骤续跑或人工补充",
+              status,
+              message,
             },
           })
           .run();
@@ -366,14 +461,12 @@ export async function runQuestionExtraction(
     async ({ sourceId, pages: sourcePages, formulas, batch, key }) => {
       if (completed.has(key)) return;
       const result = batch.length
-        ? await extractBatch(batch, courseId, context)
-        : null;
-      hooks.tokens(result?.tokens || 0);
-      const items =
-        result?.data.questions ||
-        batch.filter((q) => q.numbered).map(ruleQuestion);
+        ? await extractBatch(batch, courseId, context, hooks)
+        : { items: [], ruleBased: true };
+      const items = result.items;
+      const fallbackCount = items.filter((item) => item.ruleBased).length;
       db.transaction((tx) => {
-        for (const [index, item] of items.entries()) {
+        for (const [index, { data: item, ruleBased }] of items.entries()) {
           const boundary =
             batch.find((q) => q.id === item.sourceQuestionId) ||
             (items.length === batch.length ? batch[index] : undefined);
@@ -456,7 +549,7 @@ export async function runQuestionExtraction(
                 questionId: boundary?.id,
                 endPage: boundary?.endPage,
               },
-              confidence: result ? item.confidence : "low",
+              confidence: ruleBased ? "low" : item.confidence,
               verified: false,
               reviewStatus: "needs_review",
             })
@@ -466,8 +559,12 @@ export async function runQuestionExtraction(
           .values({
             courseId,
             key,
-            status: result ? "done" : "needs_review",
-            message: result ? null : "该批习题使用规则抽取，待核对",
+            status: result.ruleBased ? "needs_review" : "done",
+            message: result.ruleBased
+              ? fallbackCount
+                ? `该批 ${fallbackCount} 题使用规则抽取，待核对`
+                : "该批习题未能抽取，待核对"
+              : null,
           })
           .onConflictDoNothing()
           .run();
