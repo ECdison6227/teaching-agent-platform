@@ -57,7 +57,11 @@ test("迁移可重复；课程、文件去重、队列领取与过期任务", ()
   assert.equal(claimJob(), null);
   database()
     .db.update(jobs)
-    .set({ heartbeatAt: "2000-01-01T00:00:00.000Z" })
+    .set({
+      heartbeatAt: "2000-01-01T00:00:00.000Z",
+      leaseExpiresAt: "2000-01-01T00:00:00.000Z",
+      leaseOwner: null,
+    })
     .where(eq(jobs.id, job.id))
     .run();
   claimJob();

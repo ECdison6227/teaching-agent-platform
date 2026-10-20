@@ -185,6 +185,8 @@ export const jobs = sqliteTable(
     startedAt: text("started_at"),
     finishedAt: text("finished_at"),
     heartbeatAt: text("heartbeat_at"),
+    leaseOwner: text("lease_owner"),
+    leaseExpiresAt: text("lease_expires_at"),
   },
   (t) => [index("job_queue").on(t.status, t.createdAt)],
 );

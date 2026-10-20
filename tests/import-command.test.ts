@@ -130,6 +130,29 @@ test("成功命令保留输出；启动失败与输出超限正常拒绝", async
   );
 });
 
+test("失租信号立即取消自建转换命令；已中止的任务不启动命令", async () => {
+  const controller = new AbortController();
+  const reason = new Error("租约已被回收，停止转换");
+  const started = performance.now();
+  const pending = command(
+    process.execPath,
+    ["-e", "setTimeout(() => {}, 10000)"],
+    1,
+    controller.signal,
+  );
+  const timer = setTimeout(() => controller.abort(reason), 100);
+  try {
+    await assert.rejects(pending, (error) => error === reason);
+    assert.ok(performance.now() - started < 2000);
+    assert.throws(
+      () => command("must-not-spawn", [], 1, controller.signal),
+      (error) => error === reason,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
 test("页池按完成计数、保持结果顺序，并在致命错误后等在途任务退出", async () => {
   process.env.IMPORT_PAGE_CONCURRENCY = "2";
   const progress: number[] = [];

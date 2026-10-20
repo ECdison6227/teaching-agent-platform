@@ -3,7 +3,13 @@ import path from "node:path";
 import { importCommandTimeout } from "./import-settings";
 
 /** 每条转换命令独占进程组，失败只清理该组，不影响 worker 或其他导入。 */
-export function command(bin: string, args: string[], pageCount = 1) {
+export function command(
+  bin: string,
+  args: string[],
+  pageCount = 1,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
   const timeout = importCommandTimeout(path.basename(bin), pageCount);
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn(bin, args, {
@@ -28,6 +34,14 @@ export function command(bin: string, args: string[], pageCount = 1) {
       }
     };
     const timer = setTimeout(() => fail(`超时 ${timeout} ms`), timeout);
+    const abort = () => {
+      failure =
+        signal!.reason instanceof Error
+          ? signal!.reason
+          : new Error("导入任务已中止");
+      fail("任务已中止");
+    };
+    signal?.addEventListener("abort", abort, { once: true });
     const collect = (target: Buffer[]) => (chunk: Buffer) => {
       size += chunk.length;
       if (size > 4 * 1024 * 1024) fail("命令输出超过 4 MiB");
@@ -42,6 +56,7 @@ export function command(bin: string, args: string[], pageCount = 1) {
     });
     child.once("close", (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
       if (!failure && code !== 0) fail(`退出码 ${code}`);
       if (failure) reject(failure);
       else

@@ -66,6 +66,7 @@ export async function recordModelDiagnostic(
     );
     console.warn(
       JSON.stringify({
+        timestamp: new Date().toISOString(),
         event: details.recovered
           ? "model_output_normalized"
           : "model_output_invalid",
@@ -78,6 +79,7 @@ export async function recordModelDiagnostic(
   } catch {
     console.warn(
       JSON.stringify({
+        timestamp: new Date().toISOString(),
         event: "model_diagnostic_write_failed",
         ...context,
         issues,

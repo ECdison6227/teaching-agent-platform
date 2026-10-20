@@ -17,6 +17,7 @@ import {
   importItems,
 } from "../db/schema";
 import { courseDir, redactPII, storagePath } from "./storage";
+import { leaseFields, reapExpiredJobs } from "./job-lease";
 
 export class HttpError extends Error {
   constructor(
@@ -307,6 +308,8 @@ export function restartQuestionSteps(
   from: "questions" | "answers" | "formulas",
 ) {
   const { db, sqlite } = database();
+  // Keep a live owner's grace extension even when the reset is rejected below.
+  sqlite.transaction(() => reapExpiredJobs(courseId)).immediate();
   return sqlite
     .transaction(() => {
       getCourse(courseId);
@@ -363,7 +366,7 @@ export function restartQuestionSteps(
           status: "running",
           createdAt: now(),
           startedAt: now(),
-          heartbeatAt: now(),
+          ...leaseFields(),
           step:
             from === "questions"
               ? "重抽习题"

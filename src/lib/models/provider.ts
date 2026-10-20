@@ -269,6 +269,7 @@ async function request<T>(
       metrics.networkRetries++;
       console.info(
         JSON.stringify({
+          timestamp: new Date().toISOString(),
           event: "model_retry",
           provider: cfg.id,
           retry,
@@ -348,6 +349,7 @@ export async function structured<S extends z.ZodTypeAny>(
   input: string,
   image?: string,
   options: {
+    signal?: AbortSignal;
     retries?: number;
     temperature?: number;
     onMetrics?: (metrics: ModelMetrics) => void;
@@ -360,6 +362,7 @@ export async function structured<S extends z.ZodTypeAny>(
   tokens: number;
   metrics: ModelMetrics;
 } | null> {
+  options.signal?.throwIfAborted();
   const vision = image && resolveProviderConfig(task, true);
   const cfg = vision || resolveProviderConfig(task);
   if (!cfg) return null;
@@ -413,8 +416,11 @@ export async function structured<S extends z.ZodTypeAny>(
           },
           metrics,
           async (res) => res.json(),
+          options.signal,
         );
+        options.signal?.throwIfAborted();
       } catch (error) {
+        options.signal?.throwIfAborted();
         // Exhausted transport retries must not multiply by the parsing budget.
         if (!(error instanceof SyntaxError)) {
           failureKind = "transport";
@@ -459,6 +465,7 @@ export async function structured<S extends z.ZodTypeAny>(
           metrics,
         };
       } catch (error) {
+        options.signal?.throwIfAborted();
         lastError = error;
         failureKind = error instanceof z.ZodError ? "schema" : "parse";
         if (options.diagnostic)
@@ -476,6 +483,7 @@ export async function structured<S extends z.ZodTypeAny>(
     }
     throw lastError;
   } catch (error) {
+    options.signal?.throwIfAborted();
     throw new ModelOutputError(
       error instanceof z.ZodError
         ? `模型 ${task} 的 JSON 不符合 schema`

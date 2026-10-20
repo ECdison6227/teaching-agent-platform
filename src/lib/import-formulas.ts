@@ -21,6 +21,7 @@ import {
   type Source,
 } from "../db/schema";
 import { command } from "./import-command";
+import { importWrite, type ImportHooks } from "./import-task";
 import { readCachedPage, type ParsedPage } from "./import-cache";
 import {
   applyOmml,
@@ -43,10 +44,7 @@ import {
 } from "./question-parser";
 import { redactPII, storagePath } from "./storage";
 
-export type FormulaHooks = {
-  tokens: (amount: number) => void;
-  progress: (value: number, step: string) => void;
-};
+export type FormulaHooks = ImportHooks;
 export type FormulaSource = {
   sourceId: string;
   pages: { text: string }[];
@@ -94,7 +92,10 @@ function marker(courseId: string, key: string, recovery: FormulaRecovery) {
     })
     .run();
 }
-async function documentMath(source: Source): Promise<MathParagraph[]> {
+async function documentMath(
+  source: Source,
+  signal?: AbortSignal,
+): Promise<MathParagraph[]> {
   let docx = storagePath(source.storageKey);
   if (/\.doc$/i.test(source.filename)) {
     const key = `${folderKey(source)}/omml`,
@@ -106,22 +107,32 @@ async function documentMath(source: Source): Promise<MathParagraph[]> {
         ".docx",
     );
     if (!(await exists(converted)))
-      await command("soffice", [
-        `-env:UserInstallation=${pathToFileURL(path.join(folder, "lo-profile")).href}`,
-        "--headless",
-        "--convert-to",
-        "docx:Office Open XML Text",
-        "--outdir",
-        folder,
-        docx,
-      ]);
+      await command(
+        "soffice",
+        [
+          `-env:UserInstallation=${pathToFileURL(path.join(folder, "lo-profile")).href}`,
+          "--headless",
+          "--convert-to",
+          "docx:Office Open XML Text",
+          "--outdir",
+          folder,
+          docx,
+        ],
+        1,
+        signal,
+      );
     docx = converted;
   }
-  const { stdout } = await command("unzip", ["-p", docx, "word/document.xml"]);
+  const { stdout } = await command(
+    "unzip",
+    ["-p", docx, "word/document.xml"],
+    1,
+    signal,
+  );
   return docxMathParagraphs(stdout);
 }
 /** The same PDF and page image naming used by the main importer, including legacy resumes. */
-async function pageImage(source: Source, page: number) {
+async function pageImage(source: Source, page: number, signal?: AbortSignal) {
   const key = folderKey(source),
     folder = storagePath(key);
   await mkdir(folder, { recursive: true });
@@ -129,15 +140,20 @@ async function pageImage(source: Source, page: number) {
   if (!(await exists(storagePath(imageKey)))) {
     const pdf = storagePath(source.pdfKey || `${key}/document.pdf`);
     if (!(await exists(pdf))) {
-      await command("soffice", [
-        `-env:UserInstallation=${pathToFileURL(path.join(folder, "formula-lo-profile")).href}`,
-        "--headless",
-        "--convert-to",
-        "pdf",
-        "--outdir",
-        folder,
-        storagePath(source.storageKey),
-      ]);
+      await command(
+        "soffice",
+        [
+          `-env:UserInstallation=${pathToFileURL(path.join(folder, "formula-lo-profile")).href}`,
+          "--headless",
+          "--convert-to",
+          "pdf",
+          "--outdir",
+          folder,
+          storagePath(source.storageKey),
+        ],
+        1,
+        signal,
+      );
       await copyFile(
         path.join(
           folder,
@@ -147,18 +163,23 @@ async function pageImage(source: Source, page: number) {
         pdf,
       );
     }
-    await command("pdftoppm", [
-      "-f",
-      String(page),
-      "-l",
-      String(page),
-      "-singlefile",
-      "-scale-to",
-      "1400",
-      "-png",
-      pdf,
-      storagePath(imageKey).slice(0, -4),
-    ]);
+    await command(
+      "pdftoppm",
+      [
+        "-f",
+        String(page),
+        "-l",
+        String(page),
+        "-singlefile",
+        "-scale-to",
+        "1400",
+        "-png",
+        pdf,
+        storagePath(imageKey).slice(0, -4),
+      ],
+      1,
+      signal,
+    );
   }
   return `data:image/png;base64,${(await readFile(storagePath(imageKey))).toString("base64")}`;
 }
@@ -233,7 +254,8 @@ async function repairUnit(
             "questions",
             VisionSchema,
             `课程 ID：${courseId}。步骤：公式视觉回填。资料 ID：${source.id}，页码：${page}，题目定位 ID：${unit.id}。只查看此页原文，按题号定位下列题目（教材则为整页），将遗漏的嵌入式公式转为 $LaTeX$ 并回填题干和全部选项。保留题号、所有原文字句、选项 ID、答题括号/填空槽及原文答案；禁止推导、补题或猜测。看不清或题号不匹配时 text=null。返回 {"text":"含公式的完整原文或null","confidence":0到1,"complete":是否已补齐全部缺失公式}。完整原文：\n${text}`,
-            await pageImage(source, page),
+            await pageImage(source, page, hooks.signal),
+            { signal: hooks.signal },
           );
           hooks.tokens(result?.tokens || 0);
           const data = result?.data;
@@ -262,9 +284,11 @@ async function repairUnit(
           incomplete = !data.complete || gaps(text).length > 0;
           if (!incomplete) break;
         } catch {
+          hooks.signal?.throwIfAborted();
           // Individual page/model errors must not prevent later questions from importing.
           console.warn(
             JSON.stringify({
+              timestamp: new Date().toISOString(),
               event: "formula_vision_fallback",
               courseId,
               sourceId: source.id,
@@ -333,15 +357,18 @@ export async function recoverSourceFormulas(
       );
       if (value.hash === hash) saved = value;
     } catch {
+      hooks.signal?.throwIfAborted();
       /* First pass or invalid cache. */
     }
   if (!saved) {
     let paragraphs: MathParagraph[] = [];
     try {
-      paragraphs = await documentMath(source);
+      paragraphs = await documentMath(source, hooks.signal);
     } catch {
+      hooks.signal?.throwIfAborted();
       console.warn(
         JSON.stringify({
+          timestamp: new Date().toISOString(),
           event: "formula_omml_fallback",
           courseId,
           sourceId: source.id,
@@ -350,6 +377,7 @@ export async function recoverSourceFormulas(
     }
     saved = { hash, units: [] };
     for (const unit of units) {
+      hooks.signal?.throwIfAborted();
       saved.units.push(
         await repairUnit(courseId, source, unit, paragraphs, hooks),
       );
@@ -366,10 +394,12 @@ export async function recoverSourceFormulas(
   for (const unit of saved.units)
     if (unit.recovery) {
       formulas[unit.id] = unit.recovery;
-      marker(
-        courseId,
-        `formulas:v1:${source.id}:${source.kind === "textbook" ? "page" : "question"}:${unit.id}`,
-        unit.recovery,
+      importWrite(hooks, () =>
+        marker(
+          courseId,
+          `formulas:v1:${source.id}:${source.kind === "textbook" ? "page" : "question"}:${unit.id}`,
+          unit.recovery!,
+        ),
       );
     }
   return {
@@ -426,33 +456,41 @@ export async function runFormulaStep(
     recovered.push(result);
     if (source.kind === "textbook") {
       for (const [i, page] of result.pages.entries()) {
-        const row = db
-          .update(pages)
-          .set({ rawText: page.text })
-          .where(
-            and(
-              eq(pages.courseId, courseId),
-              eq(pages.sourceId, source.id),
-              eq(pages.sourcePage, i + 1),
-            ),
-          )
-          .returning()
-          .get();
+        const row = importWrite(hooks, () =>
+          db
+            .update(pages)
+            .set({ rawText: page.text })
+            .where(
+              and(
+                eq(pages.courseId, courseId),
+                eq(pages.sourceId, source.id),
+                eq(pages.sourcePage, i + 1),
+              ),
+            )
+            .returning()
+            .get(),
+        );
         if (row && result.formulas[String(i + 1)]?.status === "missing")
-          db.update(pageNotes)
-            .set({ qaStatus: "needs_review" })
-            .where(eq(pageNotes.pageId, row.id))
-            .run();
+          importWrite(hooks, () =>
+            db
+              .update(pageNotes)
+              .set({ qaStatus: "needs_review" })
+              .where(eq(pageNotes.pageId, row.id))
+              .run(),
+          );
       }
       const textKey = `${folderKey(source)}/formula-text.txt`;
       await writeFile(
         storagePath(textKey),
         result.pages.map((p) => p.text).join("\n\f\n"),
       );
-      db.update(sources)
-        .set({ textKey })
-        .where(and(eq(sources.courseId, courseId), eq(sources.id, source.id)))
-        .run();
+      importWrite(hooks, () =>
+        db
+          .update(sources)
+          .set({ textKey })
+          .where(and(eq(sources.courseId, courseId), eq(sources.id, source.id)))
+          .run(),
+      );
     } else {
       const existing = db
         .select()
@@ -474,21 +512,24 @@ export async function runFormulaStep(
         );
         if (candidates.length !== 1) {
           if (Object.keys(result.formulas).length)
-            db.update(questions)
-              .set({
-                formulaRecovery: {
-                  status: "missing",
-                  evidence: [],
-                  reasons: [
-                    "无法按题号可靠定位公式，请核对原文或从 questions 重抽",
-                  ],
-                },
-                reviewStatus: "needs_review",
-              })
-              .where(
-                and(eq(questions.courseId, courseId), eq(questions.id, q.id)),
-              )
-              .run();
+            importWrite(hooks, () =>
+              db
+                .update(questions)
+                .set({
+                  formulaRecovery: {
+                    status: "missing",
+                    evidence: [],
+                    reasons: [
+                      "无法按题号可靠定位公式，请核对原文或从 questions 重抽",
+                    ],
+                  },
+                  reviewStatus: "needs_review",
+                })
+                .where(
+                  and(eq(questions.courseId, courseId), eq(questions.id, q.id)),
+                )
+                .run(),
+            );
           continue;
         }
         const boundary = candidates[0],
@@ -499,19 +540,24 @@ export async function runFormulaStep(
           q.prompt !== repaired.prompt ||
           JSON.stringify(q.options || []) !==
             JSON.stringify(repaired.options || []);
-        db.update(questions)
-          .set({
-            prompt: redactPII(repaired.prompt),
-            options: repaired.options,
-            formulaRecovery: recovery,
-            verified: false,
-            reviewStatus: "needs_review",
-            ...(changed && q.answerMethod !== "source"
-              ? { answer: null, answerMethod: null, analysis: "" }
-              : {}),
-          })
-          .where(and(eq(questions.courseId, courseId), eq(questions.id, q.id)))
-          .run();
+        importWrite(hooks, () =>
+          db
+            .update(questions)
+            .set({
+              prompt: redactPII(repaired.prompt),
+              options: repaired.options,
+              formulaRecovery: recovery,
+              verified: false,
+              reviewStatus: "needs_review",
+              ...(changed && q.answerMethod !== "source"
+                ? { answer: null, answerMethod: null, analysis: "" }
+                : {}),
+            })
+            .where(
+              and(eq(questions.courseId, courseId), eq(questions.id, q.id)),
+            )
+            .run(),
+        );
       }
     }
   }

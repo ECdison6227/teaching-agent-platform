@@ -9,6 +9,8 @@ import { database } from "../src/db";
 import { jobs } from "../src/db/schema";
 import { and, eq } from "drizzle-orm";
 
+const timestamp = () => `[${new Date().toISOString()}]`;
+
 async function main() {
   const courseId = process.argv[2];
   const args = process.argv.slice(3);
@@ -24,7 +26,7 @@ async function main() {
     );
   const course = getCourse(courseId);
   if (!from && course.status === "ready") {
-    console.log(`课程 ${courseId} 已完成，无需续跑。`);
+    console.log(`${timestamp()} 课程 ${courseId} 已完成，无需续跑。`);
     return;
   }
   // Reap expired leases without touching a live worker, then claim only this course.
@@ -33,27 +35,34 @@ async function main() {
     : claimJob(courseId);
   const job = expiredOrQueued || enqueueImport(courseId);
   if (!expiredOrQueued && job.status === "running") {
-    console.log(`课程已有运行任务 ${job.id}，由现有 worker 继续处理。`);
+    console.log(
+      `${timestamp()} 课程已有运行任务 ${job.id}，由现有 worker 继续处理。`,
+    );
     return;
   }
   const claimed = expiredOrQueued || claimJob(courseId);
   if (!claimed) {
-    console.log(`任务 ${job.id} 已交给其他 worker。`);
+    console.log(`${timestamp()} 任务 ${job.id} 已交给其他 worker。`);
     return;
   }
+  console.log(
+    `${timestamp()} 任务 ${claimed.id} 开始续跑（${claimed.type}）。`,
+  );
   await importJob(claimed.id);
   const result = database()
     .db.select()
     .from(jobs)
     .where(and(eq(jobs.id, claimed.id), eq(jobs.courseId, courseId)))
     .get()!;
-  console.log(`任务 ${result.id}：${result.status} · ${result.step}`);
+  console.log(
+    `${timestamp()} 任务 ${result.id}：${result.status} · ${result.step}`,
+  );
   if (result.status === "failed") {
-    console.error(result.error);
+    console.error(`${timestamp()} ${result.error}`);
     process.exitCode = 1;
   }
 }
 main().catch((error) => {
-  console.error(error.message);
+  console.error(`${timestamp()} ${error.message}`);
   process.exitCode = 1;
 });

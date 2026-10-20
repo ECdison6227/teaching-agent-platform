@@ -38,11 +38,13 @@ export async function generatePageNote({
   language = "zh",
   image,
   transcribe = false,
+  signal,
 }: {
   text: string;
   language?: string;
   image?: string;
   transcribe?: boolean;
+  signal?: AbortSignal;
 }): Promise<PageNoteResult> {
   const title = pageTitle(text, language);
   const schema = PageNoteSchema.transform((note) => ({
@@ -69,6 +71,7 @@ export async function generatePageNote({
       notePrompt(text, title, language),
       image,
       {
+        signal,
         retries: 2,
         onMetrics: (value) => {
           metrics = value;
@@ -84,6 +87,7 @@ export async function generatePageNote({
         metrics,
       };
   } catch {
+    signal?.throwIfAborted();
     model = "rules:model-failed";
   }
   return {

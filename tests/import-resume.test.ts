@@ -217,6 +217,43 @@ test("从讲义和习题写入故障续跑，保留页图/原文/审核内容并
     { env: process.env },
   );
   assert.match(cli.stdout, /done/);
+  const stepLogs = cli.stdout
+    .split("\n")
+    .filter((line) => line.startsWith("{"))
+    .map((line) => JSON.parse(line));
+  const startedSteps = stepLogs.filter(
+    (entry) => entry.event === "import_step_start",
+  );
+  const endedSteps = stepLogs.filter(
+    (entry) => entry.event === "import_step_end",
+  );
+  assert.deepEqual(
+    startedSteps.map((entry) => entry.step),
+    [
+      "convert",
+      "formulas",
+      "structure",
+      "notes",
+      "textbook",
+      "questions",
+      "answers",
+      "validate",
+    ],
+  );
+  assert.deepEqual(
+    endedSteps.map((entry) => entry.step),
+    startedSteps.map((entry) => entry.step),
+  );
+  assert.ok(
+    [...startedSteps, ...endedSteps].every((entry) =>
+      /^\d{4}-\d\d-\d\dT/.test(entry.timestamp),
+    ),
+  );
+  assert.ok(
+    endedSteps.every(
+      (entry) => entry.status === "done" && entry.elapsedMs >= 0,
+    ),
+  );
   assert.equal(courseContent(other.id).jobs[0].id, otherJob.id);
   assert.equal(courseContent(other.id).jobs[0].status, "queued");
   assert.deepEqual(courseContent(course.id).pages, resumed.pages);

@@ -9,6 +9,7 @@ import {
   type Question,
 } from "../db/schema";
 import { uid } from "./courses";
+import { importWrite, type ImportHooks } from "./import-task";
 import { redactPII } from "./storage";
 import { formulaGapReasons, type FormulaRecovery } from "./formulas";
 import { structured, ModelOutputError } from "./models/provider";
@@ -37,10 +38,7 @@ type QuestionSource = {
   formulas?: Record<string, FormulaRecovery>;
 };
 type Context = ReturnType<typeof questionContext>;
-type Hooks = {
-  progress: (value: number, step: string) => void;
-  tokens: (amount: number) => void;
-};
+type Hooks = ImportHooks;
 type ExtractedItem = {
   data: (typeof QuestionsSchema._output.questions)[number];
   ruleBased: boolean;
@@ -170,6 +168,7 @@ async function extractBatch(
       `课程 ID：${courseId}。步骤：习题抽取与知识点关联。只抽原文已有题目，不编题，本步骤不推导答案。按题目边界逐题返回，不合并、不遗漏。\n返回 {"questions":[{"sourceQuestionId":"原题id","type":"choice|truefalse|fill|calc|short","prompt":"去除题号与选项的题干","options":[{"id":"A","text":"选项"}],"answer":null,"analysis":"原文解析或空字符串","kpId":null,"kpConfidence":0,"pages":[],"sourcePage":1,"confidence":"high|mid|low"}]}。识别 A．/A./A、/（A）及行内多选项，选项只能放 options；公式保留原样或合法 LaTeX。typeHint 是大题标题提示。缺答案必须 null。判断答案 T/F。\n知识点必须根据标题、关键词、讲义、页要点与题意的相似度判断，返回候选中的 kpId 与 0–1 置信度。课程没有对应概念时 kpId=null，不能挂到宽泛或相邻主题。pages 只引用匹配知识点的真实课件页码。\n共享知识点资料：${JSON.stringify(referenceIndex)}\n原文：${JSON.stringify(batch.map((q) => ({ page: q.page, id: q.id, typeHint: q.typeHint, text: q.text, preprocessed: q.numbered ? ruleQuestion(q) : undefined, candidates: candidates.get(q.id)?.map(({ kpId, title, keywords, similarity }) => ({ kpId, title, keywords, similarity, pagePoints: referenceIndex.find((r) => r.kpId === kpId)?.pagePoints.map((p) => ({ page: p.page })) })) })))}`,
       undefined,
       {
+        signal: hooks.signal,
         normalize: normalizeQuestionsOutput,
         diagnostic: {
           courseId,
@@ -194,6 +193,7 @@ async function extractBatch(
         })),
       };
   } catch (error) {
+    hooks.signal?.throwIfAborted();
     // Splitting a throttled request would amplify upstream load.
     if (error instanceof ModelOutputError && error.status === 429) throw error;
     if (
@@ -204,6 +204,7 @@ async function extractBatch(
       const size = batch.length > 5 ? Math.ceil(batch.length / 2) : 1;
       console.info(
         JSON.stringify({
+          timestamp: new Date().toISOString(),
           event: "import_question_batch_split",
           courseId,
           size: batch.length,
@@ -226,6 +227,7 @@ async function extractBatch(
     }
     console.warn(
       JSON.stringify({
+        timestamp: new Date().toISOString(),
         event: "import_question_batch_fallback",
         courseId,
         error: error instanceof Error ? error.message : "模型抽取失败",
@@ -284,6 +286,7 @@ async function deriveAnswer(
         `${base}\n推导轮次：${round}。${instruction}`,
         undefined,
         {
+          signal: hooks.signal,
           temperature,
           normalize: normalizeAnswerOutput,
           diagnostic: { courseId, item: `answer:${question.id}:${round}` },
@@ -294,10 +297,12 @@ async function deriveAnswer(
       const answer = normalizeQuestionAnswer(question, result.data.answer);
       return answer ? { answer, analysis: result.data.analysis } : null;
     } catch (error) {
+      hooks.signal?.throwIfAborted();
       if (error instanceof ModelOutputError && error.status === 429)
         rateLimited = true;
       console.warn(
         JSON.stringify({
+          timestamp: new Date().toISOString(),
           event: rateLimited
             ? "import_question_answer_deferred"
             : "import_question_answer_failed",
@@ -359,6 +364,7 @@ export async function runQuestionAnswers(courseId: string, hooks: Hooks) {
   await mapImportPages(
     pending,
     async (question) => {
+      hooks.signal?.throwIfAborted();
       // Once this run exhausts the 429 budget, leave the remaining queue resumable.
       // In-flight independent rounds still settle before the worker finishes.
       const derived = throttled
@@ -377,39 +383,41 @@ export async function runQuestionAnswers(courseId: string, hooks: Hooks) {
         : deferred
           ? "上游限流，答案待处理，可续跑"
           : "答案未能可靠推导，可从 answers 步骤续跑或人工补充";
-      db.transaction((tx) => {
-        if (result)
-          tx.update(questions)
-            .set({
-              ...result,
-              answer: redactPII(result.answer),
-              analysis: redactPII(result.analysis),
-              reviewStatus: "needs_review",
-              verified: false,
-            })
-            .where(
-              and(
-                eq(questions.courseId, courseId),
-                eq(questions.id, question.id),
-              ),
-            )
-            .run();
-        tx.insert(importItems)
-          .values({
-            courseId,
-            key: `answers:${question.id}`,
-            status,
-            message,
-          })
-          .onConflictDoUpdate({
-            target: [importItems.courseId, importItems.key],
-            set: {
+      importWrite(hooks, () =>
+        db.transaction((tx) => {
+          if (result)
+            tx.update(questions)
+              .set({
+                ...result,
+                answer: redactPII(result.answer),
+                analysis: redactPII(result.analysis),
+                reviewStatus: "needs_review",
+                verified: false,
+              })
+              .where(
+                and(
+                  eq(questions.courseId, courseId),
+                  eq(questions.id, question.id),
+                ),
+              )
+              .run();
+          tx.insert(importItems)
+            .values({
+              courseId,
+              key: `answers:${question.id}`,
               status,
               message,
-            },
-          })
-          .run();
-      });
+            })
+            .onConflictDoUpdate({
+              target: [importItems.courseId, importItems.key],
+              set: {
+                status,
+                message,
+              },
+            })
+            .run();
+        }),
+      );
     },
     (completed) =>
       hooks.progress(
@@ -459,116 +467,121 @@ export async function runQuestionExtraction(
   await mapImportPages(
     batches,
     async ({ sourceId, pages: sourcePages, formulas, batch, key }) => {
+      hooks.signal?.throwIfAborted();
       if (completed.has(key)) return;
       const result = batch.length
         ? await extractBatch(batch, courseId, context, hooks)
         : { items: [], ruleBased: true };
       const items = result.items;
       const fallbackCount = items.filter((item) => item.ruleBased).length;
-      db.transaction((tx) => {
-        for (const [index, { data: item, ruleBased }] of items.entries()) {
-          const boundary =
-            batch.find((q) => q.id === item.sourceQuestionId) ||
-            (items.length === batch.length ? batch[index] : undefined);
-          const rules = boundary?.numbered ? ruleQuestion(boundary) : undefined;
-          const recovery = boundary && formulas?.[boundary.id];
-          const q = normalizeQuestion(
-            {
-              ...item,
-              ...(recovery && rules ? { prompt: rules.prompt } : {}),
-              options: rules?.options || item.options,
-            },
-            boundary?.typeHint,
-          );
-          const kp =
-            item.kpConfidence >= importQuestionKpThreshold()
-              ? context.find((k) => k.id === item.kpId)
+      importWrite(hooks, () =>
+        db.transaction((tx) => {
+          for (const [index, { data: item, ruleBased }] of items.entries()) {
+            const boundary =
+              batch.find((q) => q.id === item.sourceQuestionId) ||
+              (items.length === batch.length ? batch[index] : undefined);
+            const rules = boundary?.numbered
+              ? ruleQuestion(boundary)
               : undefined;
-          const linked =
-            kp?.pages.filter((p) => item.pages.includes(p.page)) || [];
-          const pageIds = (
-            linked.length ? linked : kp?.pages.slice(0, 1) || []
-          ).map((p) => p.id);
-          const sourcePage =
-            boundary?.page ||
-            (item.sourcePage && item.sourcePage <= sourcePages.length
-              ? item.sourcePage
-              : batch[0]?.page || 1);
-          const prompt = redactPII(q.prompt);
-          const duplicate = tx
-            .select()
-            .from(questions)
-            .where(
-              and(
-                eq(questions.courseId, courseId),
-                eq(questions.prompt, prompt),
-              ),
-            )
-            .all()
-            .some(
-              (existing) =>
-                existing.source !== "generated" &&
-                existing.source.sourceId === sourceId &&
-                existing.source.page === sourcePage,
-            );
-          if (duplicate) continue;
-          // An extraction response must not bypass independent derivation for a source without an answer.
-          const answer = normalizeQuestionAnswer(
-            q,
-            rules ? rules.answer : item.answer,
-          );
-          tx.insert(questions)
-            .values({
-              id: uid(),
-              courseId,
-              code: `Q-${String(++number).padStart(3, "0")}`,
-              type: q.type,
-              prompt,
-              options: q.options?.map((o) => ({
-                ...o,
-                text: redactPII(o.text),
-              })),
-              answer: answer ? redactPII(answer) : null,
-              analysis: redactPII(item.analysis || ""),
-              formulaRecovery:
-                recovery ||
-                (formulaGapReasons(q.prompt, q.options).length
-                  ? {
-                      status: "missing",
-                      evidence: [],
-                      reasons: formulaGapReasons(q.prompt, q.options),
-                    }
-                  : null),
-              answerMethod: answer ? "source" : null,
-              kpId: kp?.id || null,
-              kpConfidence: kp ? item.kpConfidence : 0,
-              pageIds,
-              source: {
-                sourceId,
-                page: sourcePage,
-                questionId: boundary?.id,
-                endPage: boundary?.endPage,
+            const recovery = boundary && formulas?.[boundary.id];
+            const q = normalizeQuestion(
+              {
+                ...item,
+                ...(recovery && rules ? { prompt: rules.prompt } : {}),
+                options: rules?.options || item.options,
               },
-              confidence: ruleBased ? "low" : item.confidence,
-              verified: false,
-              reviewStatus: "needs_review",
+              boundary?.typeHint,
+            );
+            const kp =
+              item.kpConfidence >= importQuestionKpThreshold()
+                ? context.find((k) => k.id === item.kpId)
+                : undefined;
+            const linked =
+              kp?.pages.filter((p) => item.pages.includes(p.page)) || [];
+            const pageIds = (
+              linked.length ? linked : kp?.pages.slice(0, 1) || []
+            ).map((p) => p.id);
+            const sourcePage =
+              boundary?.page ||
+              (item.sourcePage && item.sourcePage <= sourcePages.length
+                ? item.sourcePage
+                : batch[0]?.page || 1);
+            const prompt = redactPII(q.prompt);
+            const duplicate = tx
+              .select()
+              .from(questions)
+              .where(
+                and(
+                  eq(questions.courseId, courseId),
+                  eq(questions.prompt, prompt),
+                ),
+              )
+              .all()
+              .some(
+                (existing) =>
+                  existing.source !== "generated" &&
+                  existing.source.sourceId === sourceId &&
+                  existing.source.page === sourcePage,
+              );
+            if (duplicate) continue;
+            // An extraction response must not bypass independent derivation for a source without an answer.
+            const answer = normalizeQuestionAnswer(
+              q,
+              rules ? rules.answer : item.answer,
+            );
+            tx.insert(questions)
+              .values({
+                id: uid(),
+                courseId,
+                code: `Q-${String(++number).padStart(3, "0")}`,
+                type: q.type,
+                prompt,
+                options: q.options?.map((o) => ({
+                  ...o,
+                  text: redactPII(o.text),
+                })),
+                answer: answer ? redactPII(answer) : null,
+                analysis: redactPII(item.analysis || ""),
+                formulaRecovery:
+                  recovery ||
+                  (formulaGapReasons(q.prompt, q.options).length
+                    ? {
+                        status: "missing",
+                        evidence: [],
+                        reasons: formulaGapReasons(q.prompt, q.options),
+                      }
+                    : null),
+                answerMethod: answer ? "source" : null,
+                kpId: kp?.id || null,
+                kpConfidence: kp ? item.kpConfidence : 0,
+                pageIds,
+                source: {
+                  sourceId,
+                  page: sourcePage,
+                  questionId: boundary?.id,
+                  endPage: boundary?.endPage,
+                },
+                confidence: ruleBased ? "low" : item.confidence,
+                verified: false,
+                reviewStatus: "needs_review",
+              })
+              .run();
+          }
+          tx.insert(importItems)
+            .values({
+              courseId,
+              key,
+              status: result.ruleBased ? "needs_review" : "done",
+              message: result.ruleBased
+                ? fallbackCount
+                  ? `该批 ${fallbackCount} 题使用规则抽取，待核对`
+                  : "该批习题未能抽取，待核对"
+                : null,
             })
+            .onConflictDoNothing()
             .run();
-        }
-        tx.insert(importItems)
-          .values({
-            courseId,
-            key,
-            status: result.ruleBased ? "needs_review" : "done",
-            message: result.ruleBased
-              ? fallbackCount
-                ? `该批 ${fallbackCount} 题使用规则抽取，待核对`
-                : "该批习题未能抽取，待核对"
-              : null,
-          })
-          .onConflictDoNothing()
-          .run();
-      });
+        }),
+      );
     },
     (count) =>
       hooks.progress(
