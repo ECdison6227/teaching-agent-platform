@@ -1,0 +1,498 @@
+import assert from "node:assert/strict";
+import { spawn, execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdir, readFile, writeFile, access } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import net from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
+import { chromium, expect } from "@playwright/test";
+import { startMockModel } from "./mock-model.mjs";
+import { generateSamples } from "./generate-samples.mjs";
+import type { CourseContent } from "../src/lib/courses";
+import type { Job } from "../src/db/schema";
+
+const exec = promisify(execFile);
+async function freePort() {
+  const server = net.createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as net.AddressInfo).port;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
+}
+async function main() {
+  const runDir = path.resolve(`data/smoke/${Date.now()}`);
+  await mkdir(runDir, { recursive: true });
+  const sampleDir = generateSamples();
+  const mock = await startMockModel();
+  const port = await freePort(),
+    basePath = process.env.NEXT_PUBLIC_BASE_PATH || "",
+    base = `http://127.0.0.1:${port}${basePath}`;
+  const env = {
+    ...process.env,
+    DATA_DIR: runDir,
+    MODEL_PROVIDER: "openai-compatible",
+    OPENAI_BASE_URL: mock.url,
+    OPENAI_CHAT_BASE_URL: mock.url,
+    OPENAI_VISION_BASE_URL: mock.url,
+    OPENAI_API_KEY: "",
+    OPENAI_CHAT_API_KEY: "",
+    OPENAI_VISION_API_KEY: "",
+    OPENAI_CHAT_MODEL: "mock-chat",
+    OPENAI_VISION_MODEL: "mock-vision",
+    VISION_MODEL_PROVIDER: "openai-compatible",
+    NEXT_TELEMETRY_DISABLED: "1",
+  };
+  for (const task of ["CHAT", "STRUCTURE", "NOTES", "TEXTBOOK", "QUESTIONS"])
+    Object.assign(env, {
+      [`${task}_MODEL_PROVIDER`]: "openai-compatible",
+      [`${task}_MODEL`]: "",
+    });
+  let log = "";
+  const web = spawn(
+    process.execPath,
+    [
+      "node_modules/next/dist/bin/next",
+      existsSync(".next/BUILD_ID") ? "start" : "dev",
+      "--hostname",
+      "127.0.0.1",
+      "--port",
+      String(port),
+    ],
+    { env, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  web.stdout.on("data", (data) => {
+    log = (log + data).slice(-30000);
+  });
+  web.stderr.on("data", (data) => {
+    log = (log + data).slice(-30000);
+  });
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  async function json<T = any>(url: string, init?: RequestInit): Promise<T> {
+    const res = await fetch(base + url, init);
+    const data = await res.json();
+    assert.ok(res.ok, `${url}: ${res.status} ${JSON.stringify(data)}`);
+    return data;
+  }
+  const post = (body: unknown): RequestInit => ({
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  async function upload(id: string, kind: string, filename: string) {
+    const form = new FormData();
+    form.set("kind", kind);
+    form.set(
+      "file",
+      new File([await readFile(filename)], path.basename(filename)),
+    );
+    return json(`/api/courses/${id}/sources`, { method: "POST", body: form });
+  }
+  async function runWorker(extraEnv = {}) {
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "scripts/worker.ts", "--once"],
+      { env: { ...env, ...extraEnv }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let output = "";
+    child.stdout.on("data", (b) => {
+      output += b;
+    });
+    child.stderr.on("data", (b) => {
+      output += b;
+    });
+    const timeout = setTimeout(() => child.kill("SIGKILL"), 240_000);
+    try {
+      const code = await new Promise<number | null>((resolve, reject) => {
+        child.on("exit", resolve);
+        child.on("error", reject);
+      });
+      assert.equal(code, 0, output);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  async function checkJob(id: string) {
+    const job = await json<Job>(`/api/jobs/${id}`);
+    assert.equal(job.status, "done", job.error || job.step);
+    assert.equal(job.progress, 100);
+    return job;
+  }
+  try {
+    for (let i = 0; ; i++) {
+      try {
+        if ((await fetch(base + "/api/courses")).ok) break;
+      } catch {
+        /* 启动等待 */
+      }
+      if (i > 120 || web.exitCode !== null)
+        throw new Error(`Next 启动失败\n${log}`);
+      await delay(500);
+    }
+    console.log(`Next ready: ${base}`);
+    const chromePath =
+      process.env.CHROME_BIN ||
+      (existsSync("/opt/google/chrome/chrome")
+        ? "/opt/google/chrome/chrome"
+        : undefined);
+    browser = await chromium.launch({
+      headless: true,
+      executablePath: chromePath,
+      args: ["--no-sandbox"],
+    });
+    const context = await browser.newContext({
+      viewport: { width: 1440, height: 1000 },
+    });
+    const page = await context.newPage();
+    const pageErrors: string[] = [];
+    page.on("pageerror", (e) => pageErrors.push(e.message));
+    await page.goto(base + "/new");
+    await page
+      .getByPlaceholder("例如：概率与日常决策")
+      .fill("概率与日常决策 · Smoke");
+    const createdResponse = page.waitForResponse(
+      (r) =>
+        r.url() === base + "/api/courses" && r.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: "下一步", exact: true }).click();
+    const course = await (await createdResponse).json();
+    await page
+      .getByLabel("添加课程 PPT文件")
+      .setInputFiles(path.join(sampleDir, "probability.pdf"));
+    await page.getByRole("button", { name: "下一步", exact: true }).click();
+    await page
+      .getByLabel("添加教材文件")
+      .setInputFiles(path.join(sampleDir, "probability.pdf"));
+    await page.getByRole("button", { name: "下一步", exact: true }).click();
+    await page
+      .getByLabel("添加习题文件")
+      .setInputFiles(path.join(sampleDir, "questions.pdf"));
+    await page.getByRole("button", { name: "下一步", exact: true }).click();
+    await page
+      .getByRole("button", { name: "跳过并开始导入", exact: true })
+      .click();
+    await expect(page.getByText("正在整理你的课程")).toBeVisible();
+    let content = await json<CourseContent>(`/api/courses/${course.id}`);
+    const jobId = content.jobs[0].id;
+    assert.equal(content.sources.length, 3);
+    await runWorker();
+    const job = await checkJob(jobId);
+    content = await json<CourseContent>(`/api/courses/${course.id}`);
+    assert.equal(content.course.status, "ready");
+    assert.equal(content.pages.length, 4);
+    assert.equal(content.knowledgePoints.length, 3);
+    assert.equal(content.questions.length, 4);
+    assert.deepEqual(
+      [...new Set(content.questions.map((q) => q.type))].sort(),
+      ["choice", "fill", "short", "truefalse"],
+    );
+    assert.ok(
+      content.questions.every(
+        (q) =>
+          q.kpId &&
+          q.pageIds.length &&
+          !q.verified &&
+          q.reviewStatus === "needs_review",
+      ),
+    );
+    assert.ok(content.questions.some((q) => !q.answer));
+    assert.ok(content.knowledgePoints.every((k) => k.contentMd.length));
+    assert.ok(content.knowledgePoints.some((k) => !k.hasSlides));
+    for (const p of content.pages) {
+      assert.ok(
+        p.rawText.length &&
+          p.kpId &&
+          p.note?.points.length &&
+          p.width &&
+          p.height,
+      );
+      await access(path.join(runDir, p.imageKey));
+      const image = await fetch(
+        base + `/api/courses/${course.id}/pages/${p.index}`,
+      );
+      assert.equal(image.status, 200);
+      assert.equal(image.headers.get("content-type"), "image/png");
+    }
+    for (const source of content.sources) {
+      assert.ok(source.textKey && source.pdfKey);
+      await access(path.join(runDir, source.textKey!));
+    }
+    const download = await fetch(
+      base + `/api/courses/${course.id}/materials/${content.sources[0].id}`,
+    );
+    assert.equal(download.status, 200);
+    assert.equal((await download.text()).slice(0, 5), "%PDF-");
+    assert.equal(
+      (await fetch(base + `/api/courses/${course.id}/pages/5`)).status,
+      404,
+    );
+    await expect(
+      page.getByRole("link", { name: "进入学习空间", exact: true }),
+    ).toBeVisible({ timeout: 10000 });
+    await page.getByRole("link", { name: "进入学习空间", exact: true }).click();
+    await expect(
+      page.getByRole("heading", { name: "从一个问题，走向真正理解。" }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "带我从基础开始学习", exact: true })
+      .click();
+    await expect(
+      page.getByText("公平硬币出现正面的概率是多少？", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "查看课程页 2", exact: true }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "自学天地", exact: true }).click();
+    const image = page.getByAltText(/^课程第 1 页/);
+    await expect(image).toBeVisible();
+    await expect
+      .poll(() => image.evaluate((el: HTMLImageElement) => el.naturalWidth))
+      .toBeGreaterThan(0);
+    await page.getByRole("button", { name: "下一页", exact: true }).click();
+    await expect(page.getByAltText(/^课程第 2 页/)).toBeVisible();
+    await page.screenshot({
+      path: path.join(runDir, "study.png"),
+      fullPage: false,
+    });
+    await page.getByRole("button", { name: "A. 0.5", exact: true }).click();
+    await page
+      .getByRole("button", { name: "核对作答", exact: true })
+      .first()
+      .click();
+    await expect(page.getByText("此题答案待核对，暂不自动判分")).toBeVisible();
+    await page.getByRole("button", { name: "学习笔记", exact: true }).click();
+    await page.getByLabel("课程笔记").fill("仅属于概率课程的笔记");
+    await page.getByRole("button", { name: "保存笔记", exact: true }).click();
+    await page.reload();
+    await page.getByRole("button", { name: "学习笔记", exact: true }).click();
+    await expect(page.getByLabel("课程笔记")).toHaveValue(
+      "仅属于概率课程的笔记",
+    );
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.getByRole("button", { name: "Toggle Sidebar" }).click();
+    await expect(
+      page.getByRole("button", { name: "自学天地", exact: true }),
+    ).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.goto(base + `/teach/${course.id}/review`);
+    await page
+      .getByRole("button", { name: "确认答案已核对", exact: true })
+      .first()
+      .click();
+    await expect(page.getByRole("status")).toHaveText("已保存");
+    const revised = await json<CourseContent>(`/api/courses/${course.id}`);
+    assert.equal(revised.questions.filter((q) => q.verified).length, 1);
+    await page.screenshot({
+      path: path.join(runDir, "review.png"),
+      fullPage: false,
+    });
+    await page.goto(base + `/c/${course.slug}`);
+    await page.getByRole("button", { name: "自学天地", exact: true }).click();
+    await page.getByRole("button", { name: "A. 0.5", exact: true }).click();
+    await page
+      .getByRole("button", { name: "核对作答", exact: true })
+      .first()
+      .click();
+    await expect(page.getByText("回答正确", { exact: true })).toBeVisible();
+    const missingAnswer = revised.questions.find((q) => !q.answer)!;
+    const invalidVerification = await fetch(
+      base + `/api/courses/${course.id}/review`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: "question",
+          id: missingAnswer.id,
+          answer: null,
+          analysis: "",
+          verified: true,
+        }),
+      },
+    );
+    assert.equal(invalidVerification.status, 400);
+    console.log(
+      `PASS mock import: pages=4, text=4, knowledgePoints=3, notes=4, questions=4, tokens=${job.costTokens}; wizard + SSE chat + study + review + notes + mobile`,
+    );
+
+    // 第二门课程：无模型 + 教材 DOCX（实际通过 LibreOffice 生成并转换）+ 规则题库。
+    const office = path.join(runDir, "office");
+    await mkdir(office);
+    await writeFile(
+      path.join(office, "original.txt"),
+      "Everyday decisions\nA probability is between 0 and 1.\nA sample space lists possible outcomes.\n",
+    );
+    await exec(
+      "soffice",
+      [
+        `-env:UserInstallation=file://${office}/profile`,
+        "--headless",
+        "--convert-to",
+        "docx",
+        "--outdir",
+        office,
+        path.join(office, "original.txt"),
+      ],
+      { timeout: 60000 },
+    );
+    const second = await json<{ id: string; slug: string }>(
+      "/api/courses",
+      post({ title: "教材课程 · 无模型" }),
+    );
+    const textbook = await upload(
+      second.id,
+      "textbook",
+      path.join(office, "original.docx"),
+    );
+    assert.equal(
+      (await upload(second.id, "textbook", path.join(office, "original.docx")))
+        .id,
+      textbook.id,
+    );
+    await upload(
+      second.id,
+      "question_bank",
+      path.join(sampleDir, "questions.pdf"),
+    );
+    const queued = await json<Job>(`/api/courses/${second.id}/jobs`, {
+      method: "POST",
+    });
+    await runWorker({ MODEL_PROVIDER: "none" });
+    await checkJob(queued.id);
+    const fallback = await json<CourseContent>(`/api/courses/${second.id}`);
+    assert.equal(fallback.pages.length, 1);
+    assert.equal(fallback.questions.length, 4);
+    assert.ok(fallback.pages.every((p) => p.note?.model === "rules:no-model"));
+    assert.ok(fallback.knowledgePoints.every((k) => !k.hasSlides));
+    assert.equal(
+      (
+        await fetch(
+          base + `/api/courses/${second.id}/materials/${content.sources[0].id}`,
+        )
+      ).status,
+      404,
+    );
+    const badReview = await fetch(base + `/api/courses/${course.id}/review`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        kind: "page",
+        id: content.pages[0].id,
+        kpId: fallback.knowledgePoints[0].id,
+        title: "bad mapping",
+        points: ["bad"],
+        keys: [],
+      }),
+    });
+    assert.equal(badReview.status, 400);
+    await page.goto(base + `/c/${second.slug}`);
+    await page.getByRole("button", { name: "学习笔记", exact: true }).click();
+    await expect(page.getByLabel("课程笔记")).toHaveValue("");
+    assert.deepEqual(pageErrors, []);
+    const tasks = new Set(mock.calls.map((c) => c.task));
+    for (const task of ["structure", "notes", "textbook", "questions", "chat"])
+      assert.ok(tasks.has(task));
+    assert.ok(mock.calls.some((c) => c.vision));
+    console.log(
+      "PASS fallback import: DOCX -> PDF -> PNG/text, textbook-only, rules notes/questions, deduplication, cross-course isolation",
+    );
+    // PPTX/PPT/DOC 走真实办公文档转换；故意制造一次模型失败并重跑。
+    const fodp = `<?xml version="1.0" encoding="UTF-8"?><office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.presentation"><office:body><office:presentation><draw:page draw:name="One"><draw:frame svg:x="2cm" svg:y="2cm" svg:width="20cm" svg:height="10cm"><draw:text-box><text:p>Original probability lesson</text:p><text:p>List outcomes before computing a probability.</text:p></draw:text-box></draw:frame></draw:page><draw:page draw:name="Two"><draw:frame svg:x="2cm" svg:y="2cm" svg:width="20cm" svg:height="10cm"><draw:text-box><text:p>Independent events</text:p><text:p>One fair toss does not change the next.</text:p></draw:text-box></draw:frame></draw:page></office:presentation></office:body></office:document>`;
+    await writeFile(path.join(office, "slides.fodp"), fodp);
+    for (const ext of ["pptx", "ppt"])
+      await exec(
+        "soffice",
+        [
+          `-env:UserInstallation=file://${office}/profile`,
+          "--headless",
+          "--convert-to",
+          ext,
+          "--outdir",
+          office,
+          path.join(office, "slides.fodp"),
+        ],
+        { timeout: 60000 },
+      );
+    await exec(
+      "soffice",
+      [
+        `-env:UserInstallation=file://${office}/profile`,
+        "--headless",
+        "--convert-to",
+        "doc:MS Word 97",
+        "--outdir",
+        office,
+        path.join(office, "original.txt"),
+      ],
+      { timeout: 60000 },
+    );
+    const third = await json<{ id: string; slug: string }>(
+      "/api/courses",
+      post({ title: "办公格式与失败重试" }),
+    );
+    await upload(third.id, "slides", path.join(office, "slides.pptx"));
+    await upload(third.id, "material", path.join(office, "slides.ppt"));
+    await upload(third.id, "material", path.join(office, "original.doc"));
+    const failedJob = await json<Job>(`/api/courses/${third.id}/jobs`, {
+      method: "POST",
+    });
+    await runWorker({ OPENAI_VISION_MODEL: "mock-error" });
+    const failed = await json<Job>(`/api/jobs/${failedJob.id}`);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error || "", /429/);
+    const retried = await json<Job>(`/api/courses/${third.id}/jobs`, {
+      method: "POST",
+    });
+    await runWorker({ MODEL_PROVIDER: "none" });
+    await checkJob(retried.id);
+    const officeCourse = await json<CourseContent>(`/api/courses/${third.id}`);
+    assert.equal(officeCourse.pages.length, 2);
+    assert.ok(
+      officeCourse.sources.every((s) => s.pdfKey && s.textKey && s.pages),
+    );
+    assert.ok(officeCourse.pages.every((p) => p.rawText.length > 10));
+    console.log(
+      "PASS office/retry: PPTX + PPT + DOC -> PDF, failed job recorded, reimport replaces partial data",
+    );
+    await writeFile(
+      path.join(runDir, "result.json"),
+      JSON.stringify(
+        {
+          passed: true,
+          course: course.slug,
+          courseId: course.id,
+          fallbackCourse: second.slug,
+          mockCalls: mock.calls,
+          browserErrors: pageErrors,
+        },
+        null,
+        2,
+      ),
+    );
+    console.log(
+      `SMOKE PASS · artifacts: ${path.relative(process.cwd(), runDir)}`,
+    );
+  } catch (error) {
+    await writeFile(path.join(runDir, "next.log"), log);
+    console.error(`Smoke artifacts: ${runDir}\n${log.slice(-5000)}`);
+    throw error;
+  } finally {
+    await browser?.close();
+    web.kill("SIGTERM");
+    await new Promise<void>((resolve) => {
+      if (web.exitCode !== null) resolve();
+      else {
+        web.once("exit", () => resolve());
+        setTimeout(() => {
+          web.kill("SIGKILL");
+          resolve();
+        }, 5000).unref();
+      }
+    });
+    await mock.close();
+  }
+}
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
