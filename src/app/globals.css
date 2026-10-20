@@ -1,0 +1,109 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 45 25% 98%;
+    --foreground: 220 25% 18%;
+    --card: 0 0% 100%;
+    --card-foreground: 220 25% 18%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 25% 18%;
+    --primary: 169 57% 27%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 164 25% 94%;
+    --secondary-foreground: 169 57% 25%;
+    --muted: 40 16% 95%;
+    --muted-foreground: 220 10% 45%;
+    --accent: 163 26% 92%;
+    --accent-foreground: 169 57% 22%;
+    --destructive: 0 70% 45%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 40 14% 87%;
+    --input: 40 14% 83%;
+    --ring: 169 57% 27%;
+    --sidebar-background: 45 25% 97%;
+    --sidebar-foreground: 220 25% 18%;
+    --sidebar-primary: 169 57% 27%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 164 25% 92%;
+    --sidebar-accent-foreground: 169 57% 22%;
+    --sidebar-border: 40 14% 87%;
+    --sidebar-ring: 169 57% 27%;
+  }
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+  textarea {
+    resize: vertical;
+  }
+}
+.md-body {
+  overflow-wrap: anywhere;
+  line-height: 1.9;
+}
+.md-body p + p,
+.md-body ul,
+.md-body ol,
+.md-body pre,
+.md-body blockquote {
+  margin-top: 0.7rem;
+}
+.md-body h1,
+.md-body h2,
+.md-body h3 {
+  margin: 1rem 0 0.5rem;
+  font-weight: 600;
+}
+.md-body ul {
+  list-style: disc;
+  padding-left: 1.4rem;
+}
+.md-body ol {
+  list-style: decimal;
+  padding-left: 1.4rem;
+}
+.md-body pre {
+  overflow: auto;
+  background: hsl(var(--muted));
+  padding: 1rem;
+  border-radius: 0.5rem;
+}
+.md-body blockquote {
+  border-left: 3px solid hsl(var(--primary));
+  padding-left: 1rem;
+  color: hsl(var(--muted-foreground));
+}
+.md-body table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+.md-body th,
+.md-body td {
+  border: 1px solid hsl(var(--border));
+  padding: 0.4rem 0.7rem;
+}
+.md-body a {
+  color: hsl(var(--primary));
+  text-decoration: underline;
+}
+.hl-key {
+  background: #fff1ae;
+  color: inherit;
+  padding: 0 0.1rem;
+}
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+}

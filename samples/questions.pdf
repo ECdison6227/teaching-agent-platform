@@ -1,0 +1,41 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [4 0 R] >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 407 >>
+stream
+BT /F1 16 Tf 50 730 Td 24 TL (Practice: Everyday Probability) Tj
+T* (QUESTION 1. What is P\(heads\) for a fair coin?) Tj
+T* (A. 0.5) Tj
+T* (B. 1) Tj
+T* (Answer: A) Tj
+T* (QUESTION 2. A probability can be greater than 1. True/False) Tj
+T* (Answer: F) Tj
+T* (QUESTION 3. P\(even on a fair six-sided die\) = ____.) Tj
+T* (Answer: 0.5) Tj
+T* (QUESTION 4. Explain independent events using a daily example.) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000185 00000 n 
+0000000311 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+769
+%%EOF
